@@ -172,7 +172,7 @@ FOLD = 5
 # Chon dataset qua CLI: 'her2st' (785 gen her_hvg_cut_1000) hoac 'her2st_top250'
 # (250 gen co muc bieu hien trung binh cao nhat, chon tu count matrix truoc LOOCV split).
 _p = argparse.ArgumentParser()
-_p.add_argument('--datasets', choices=['her2st', 'her2st_top250'], default='her2st',
+_p.add_argument('--datasets', choices=['her2st', 'her2st_top250', 'brainst'], default='her2st',
                 help="Dataset dung cho training/eval (mac dinh: her2st)")
 _args = _p.parse_args()
 DATASET = _args.datasets
@@ -226,7 +226,8 @@ from torch.utils.data import Sampler
 class SectionBatchSampler(Sampler):
     def __init__(self, dataset, batch_size, shuffle=True,
                  include_sections=None, exclude_sections=None,
-                 rank=0, num_replicas=1, shard_sections=True):
+                 rank=0, num_replicas=1, shard_sections=True,
+                 section_indices_override=None):
         self.batch_size = batch_size
         self.shuffle = shuffle
 
@@ -236,6 +237,13 @@ class SectionBatchSampler(Sampler):
             name = dataset.id2name[i]
             self.section_indices[name] = list(range(start, start + length))
             start += length
+
+        # [BRAIN-ST] override cho phep chia spot-level train/val trong 1 section
+        # duy nhat (dataset chi co 1 section -> khong the exclude ca section).
+        # section_indices_override: dict section_name -> list global indices.
+        if section_indices_override is not None:
+            self.section_indices = {k: list(v)
+                                    for k, v in section_indices_override.items()}
 
         if include_sections is not None:
             self.section_indices = {k: v for k, v in self.section_indices.items()
@@ -356,14 +364,21 @@ print("Đã định nghĩa SectionBatchSampler / section_collate_fn (vá lỗi b
 # ============================================================================
 # ---- Cell 25 (notebook gốc) ----
 # ============================================================================
-from dataset import LightHGGEP_HER2ST, LightHGGEP_HER2ST_Top250
+from dataset import LightHGGEP_HER2ST, LightHGGEP_HER2ST_Top250, LightHGGEP_BRAINST
 from models.LightHGGEP import LightHGGEP
 from torch.utils.data import DataLoader
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 import pytorch_lightning as pl
 
 # Chon class dataset theo DATASET
-DATASET_CLASS = LightHGGEP_HER2ST if DATASET == 'her2st' else LightHGGEP_HER2ST_Top250
+if DATASET == 'her2st':
+    DATASET_CLASS = LightHGGEP_HER2ST
+elif DATASET == 'her2st_top250':
+    DATASET_CLASS = LightHGGEP_HER2ST_Top250
+elif DATASET == 'brainst':
+    DATASET_CLASS = LightHGGEP_BRAINST
+else:
+    raise ValueError(f"Unknown --datasets: {DATASET}")
 if N_GENES is None:
     N_GENES = len(DATASET_CLASS(train=True, fold=FOLD, k_neighbors=K_NEIGHBORS).gene_set)
     print(f"  N_GENES auto = {N_GENES}")
@@ -377,16 +392,38 @@ train_dataset = DATASET_CLASS(train=True, fold=FOLD, k_neighbors=K_NEIGHBORS)
 VAL_SECTION = sorted(train_dataset.names)[0]
 print(f"Slide dùng làm validation (tách từ tập train, KHÔNG phải test_dataset): {VAL_SECTION}")
 
+# [BRAIN-ST] dataset chi co 1 section -> khong the exclude ca section lam val.
+# Chia spot-level: 80% train / 20% val (deterministic từ seed) trong chinh section do.
+# VAL_SECTION van duoc in nhu ten section, nhung split la spot-level.
+train_override = None
+val_override = None
+if DATASET == 'brainst':
+    import numpy as _np
+    _rng = _np.random.RandomState(42)
+    _all = list(range(len(train_dataset)))
+    _rng.shuffle(_all)
+    _n_val = max(1, int(0.2 * len(_all)))
+    _val_idx = sorted(_all[:_n_val])
+    _train_idx = sorted(_all[_n_val:])
+    train_override = {VAL_SECTION: _train_idx}
+    val_override = {VAL_SECTION: _val_idx}
+    print(f"[BRAIN-ST] spot-level split: train={len(_train_idx)} val={len(_val_idx)} "
+          f"(trong section {VAL_SECTION})")
+
 DDP_RANK = int(os.environ.get("LOCAL_RANK", 0))
 # Kaggle's parent DDP process can construct the rank-0 loader before it
 # exports WORLD_SIZE.  Fall back to the configured device count so rank 0 also
 # receives only its own section shard rather than processing the full dataset.
 DDP_WORLD_SIZE = int(os.environ.get("WORLD_SIZE", N_GPUS))
 train_sampler = SectionBatchSampler(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
-                                     exclude_sections=[VAL_SECTION], rank=DDP_RANK,
+                                     exclude_sections=[VAL_SECTION] if DATASET != 'brainst' else None,
+                                     section_indices_override=train_override,
+                                     rank=DDP_RANK,
                                      num_replicas=DDP_WORLD_SIZE, shard_sections=True)
 val_sampler = SectionBatchSampler(train_dataset, batch_size=BATCH_SIZE, shuffle=False,
-                                   include_sections=[VAL_SECTION], rank=DDP_RANK,
+                                   include_sections=[VAL_SECTION] if DATASET != 'brainst' else None,
+                                   section_indices_override=val_override,
+                                   rank=DDP_RANK,
                                    num_replicas=DDP_WORLD_SIZE, shard_sections=False)
 print(f"DDP data shard: rank {DDP_RANK}/{DDP_WORLD_SIZE}; "
       f"train sections={len(train_sampler.section_names)}, "

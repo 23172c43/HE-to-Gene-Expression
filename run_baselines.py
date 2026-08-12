@@ -34,6 +34,7 @@ import numpy as np
 import torch
 import pandas as pd
 import matplotlib.pyplot as plt
+import anndata as ann
 
 warnings.filterwarnings("ignore")
 
@@ -58,6 +59,9 @@ parser = argparse.ArgumentParser(description="Baseline pipeline cho HER2ST")
 parser.add_argument("--mode",       type=str, required=True,
                     choices=["histogene", "stnet", "all"],
                     help="Model muốn chạy. 'all' = chạy các baseline tương thích giao thức chung.")
+parser.add_argument("--datasets",   type=str, default="her2st",
+                    choices=["her2st", "brainst"],
+                    help="Dataset (mac dinh: her2st). brainst = V1_Adult_Mouse_Brain (scanpy).")
 parser.add_argument("--fold",       type=int,   default=5)
 parser.add_argument("--n_genes",    type=int,   default=785)
 parser.add_argument("--max_epochs", type=int,   default=None)
@@ -108,7 +112,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, Callback
 from pytorch_lightning.loggers import CSVLogger
 
-from dataset import HER2ST
+from dataset import HER2ST, BRAINSTSpotDataset, BRAINSTSlideDataset
 from evaluation import PROTOCOL_NAME, evaluate_her2st_predictions
 from predict import stnet_predict, histogene_predict
 
@@ -226,6 +230,56 @@ def collate_drop_center(batch):
     return default_collate([item[:3] for item in batch])
 
 
+# ── BRAIN-ST helpers (V1_Adult_Mouse_Brain, 1 section duy nhất) ────────────────
+def brainst_split_train_val(spot_ds, val_frac=0.2, seed=42):
+    """Chia spot-level 80/20 trong 1 section duy nhất (BRAINST chỉ có 1 section)."""
+    rng = random.Random(seed)
+    idx = list(range(len(spot_ds)))
+    rng.shuffle(idx)
+    n_val = max(1, int(val_frac * len(idx)))
+    val_idx = idx[:n_val]
+    train_idx = idx[n_val:]
+    return Subset(spot_ds, train_idx), Subset(spot_ds, val_idx), val_idx, train_idx
+
+
+def brainst_stnet_predict(model, test_loader, device=torch.device("cpu")):
+    """Predict cho STNet tren BRAINST. test_loader yields (patch, center, exp)."""
+    model.eval(); model = model.to(device)
+    preds, gts, centers = [], [], []
+    with torch.no_grad():
+        for batch in test_loader:
+            patch, center, exp = batch
+            patch, center = patch.to(device), center.to(device)
+            pred = model(patch, center)
+            preds.append(pred.cpu()); gts.append(exp); centers.append(center.cpu())
+    preds = torch.cat(preds).numpy()
+    gts = torch.cat(gts).numpy()
+    centers = torch.cat(centers).numpy()
+    adata_pred = ann.AnnData(preds); adata_pred.obsm["spatial"] = centers
+    adata_gt = ann.AnnData(gts); adata_gt.obsm["spatial"] = centers
+    return adata_pred, adata_gt
+
+
+def brainst_histogene_predict(model, test_loader, device=torch.device("cpu")):
+    """Predict cho HisToGene tren BRAINST. test_loader yields slide-level
+    (patches_flat, centers_clamped, exp) voi batch dim san co (1, N, ...)."""
+    model.eval(); model = model.to(device)
+    all_p, all_c, all_e = [], [], []
+    with torch.no_grad():
+        for patch, loc, exp in test_loader:
+            all_p.append(patch); all_c.append(loc); all_e.append(exp)
+    # Moi phan tu da co batch dim (1, N, ...) -> cat dim0 tao (B, N, ...)
+    patches = torch.cat(all_p, 0).to(device)
+    locs = torch.cat(all_c, 0).to(device)
+    exps = torch.cat(all_e, 0).squeeze(0).numpy()
+    centers = locs.squeeze(0).cpu().numpy().astype(float)
+    with torch.no_grad():
+        pred = model(patches, locs).squeeze(0).cpu().numpy()
+    adata_pred = ann.AnnData(pred); adata_pred.obsm["spatial"] = centers
+    adata_gt = ann.AnnData(exps); adata_gt.obsm["spatial"] = centers
+    return adata_pred, adata_gt
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HÀM CHÍNH: chạy train + predict + eval cho 1 mode
 # ─────────────────────────────────────────────────────────────────────────────
@@ -285,6 +339,18 @@ def run_one(mode, fold, n_genes, lr, max_epochs, batch_size,
     monitor = _monitor[mode]
 
     # ── TRAIN ─────────────────────────────────────────────────────────────────
+    # [BRAIN-ST] Tạo dataset + n_genes override TRƯỚC block train (cần cả khi
+    # --skip_train để load đúng kích thước head của model từ checkpoint).
+    if args.datasets == "brainst":
+        print(f"  [BRAIN-ST] Dung V1_Adult_Mouse_Brain thay vi HER2ST.")
+        ds_aug   = BRAINSTSpotDataset(train=True, k_neighbors=4)
+        ds_noaug = BRAINSTSpotDataset(train=False, k_neighbors=4)
+        # BRAIN-ST chi co 250 gene (Top250) -> ghi de n_genes de khop head cua model
+        n_genes = len(ds_aug.brain.gene_set)
+        print(f"  [BRAIN-ST] n_genes override: {n_genes}")
+        train_subset, val_subset, _, _ = brainst_split_train_val(
+            ds_aug, val_frac=0.2, seed=fold)
+
     if not skip_train:
         logger = CSVLogger("logs", name=f"baseline_{mode}")
 
@@ -303,19 +369,34 @@ def run_one(mode, fold, n_genes, lr, max_epochs, batch_size,
             verbose=False,
         )
 
-        ds_aug   = HER2ST(train=True, fold=fold)
-        ds_noaug = HER2ST(train=True, fold=fold)
-        ds_noaug.train = False
-        if mode == "histogene":
-            train_subset, val_subset = split_histo_train_val(ds_aug, ds_noaug)
-            # Sections have different spot counts, therefore they cannot be
-            # stacked together.  One complete section is one training sample.
-            train_loader = DataLoader(train_subset, batch_size=1,
-                                      shuffle=True, **loader_options)
-            val_loader = DataLoader(val_subset, batch_size=1,
-                                    shuffle=False, **eval_loader_options)
+        if args.datasets == "brainst":
+            # Slide-level cho HisToGene, spot-level cho STNet (subset da tinh o tren)
+            if mode == "histogene":
+                train_loader = DataLoader(BRAINSTSlideDataset(ds_aug, list(range(len(train_subset)))),
+                                          batch_size=1, shuffle=True, **loader_options)
+                val_loader = DataLoader(BRAINSTSlideDataset(ds_noaug, list(range(len(val_subset)))),
+                                        batch_size=1, shuffle=False, **eval_loader_options)
+            else:
+                train_loader = DataLoader(train_subset, batch_size=bs,
+                                          shuffle=True, **loader_options)
+                val_loader = DataLoader(val_subset, batch_size=bs, shuffle=False,
+                                        collate_fn=collate_drop_center,
+                                        **eval_loader_options)
         else:
-            train_subset, val_subset = split_train_val(ds_aug, ds_noaug)
+            ds_aug   = HER2ST(train=True, fold=fold)
+            ds_noaug = HER2ST(train=True, fold=fold)
+            ds_noaug.train = False
+
+            if mode == "histogene":
+                train_subset, val_subset = split_histo_train_val(ds_aug, ds_noaug)
+                # Sections have different spot counts, therefore they cannot be
+                # stacked together.  One complete section is one training sample.
+                train_loader = DataLoader(train_subset, batch_size=1,
+                                          shuffle=True, **loader_options)
+                val_loader = DataLoader(val_subset, batch_size=1,
+                                        shuffle=False, **eval_loader_options)
+            else:
+                train_subset, val_subset = split_train_val(ds_aug, ds_noaug)
             # [MỚI - fix "treo"] HER2ST._get_img_cached() mặc định img_cache_size=1
             # (dataset.py, dùng chung mọi mode -- KHÔNG sửa file đó để tránh ảnh hưởng
             # HisToGene/LightHGGEP). HisToGeneSlideDataset gộp nguyên 1 section/lần gọi
@@ -387,35 +468,61 @@ def run_one(mode, fold, n_genes, lr, max_epochs, batch_size,
     print(f"\n  [PREDICT] Load: {ckpt_path}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    test_dataset = HER2ST(train=False, fold=fold)
-    label        = test_dataset.label[test_dataset.names[0]]
+    if args.datasets == "brainst":
+        # BRAIN-ST: test = toan bo section (khong LOOCV). Khong co label -> ARI/NMI NaN.
+        test_dataset = BRAINSTSpotDataset(train=False, k_neighbors=4)
+        label = None
+        if mode == "histogene":
+            m = HisToGene.load_from_checkpoint(
+                ckpt_path, patch_size=112, n_layers=8, n_genes=n_genes,
+                learning_rate=lr, max_epochs=max_ep)
+            test_loader = DataLoader(BRAINSTSlideDataset(test_dataset),
+                                     batch_size=1, shuffle=False, **eval_loader_options)
+            if torch.cuda.is_available(): torch.cuda.synchronize()
+            _t0 = time.perf_counter()
+            adata_pred, adata_gt = brainst_histogene_predict(m, test_loader, device=device)
+            if torch.cuda.is_available(): torch.cuda.synchronize()
+            inference_time_total_s = time.perf_counter() - _t0
+        elif mode == "stnet":
+            m = STModel.load_from_checkpoint(
+                ckpt_path, n_genes=n_genes, learning_rate=lr, max_epochs=max_ep)
+            test_loader = DataLoader(test_dataset, batch_size=bs,
+                                     shuffle=False, **eval_loader_options)
+            if torch.cuda.is_available(): torch.cuda.synchronize()
+            _t0 = time.perf_counter()
+            adata_pred, adata_gt = brainst_stnet_predict(m, test_loader, device=device)
+            if torch.cuda.is_available(): torch.cuda.synchronize()
+            inference_time_total_s = time.perf_counter() - _t0
+    else:
+        test_dataset = HER2ST(train=False, fold=fold)
+        label        = test_dataset.label[test_dataset.names[0]]
 
-    if mode == "histogene":
-        m = HisToGene.load_from_checkpoint(
-            ckpt_path, patch_size=112, n_layers=8, n_genes=n_genes,
-            learning_rate=lr, max_epochs=max_ep)
-        test_loader = DataLoader(test_dataset, batch_size=1,
-                                 shuffle=False, **eval_loader_options)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        _t0 = time.perf_counter()
-        adata_pred, adata_gt = histogene_predict(m, test_loader, device=device)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        inference_time_total_s = time.perf_counter() - _t0
+        if mode == "histogene":
+            m = HisToGene.load_from_checkpoint(
+                ckpt_path, patch_size=112, n_layers=8, n_genes=n_genes,
+                learning_rate=lr, max_epochs=max_ep)
+            test_loader = DataLoader(test_dataset, batch_size=1,
+                                     shuffle=False, **eval_loader_options)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            _t0 = time.perf_counter()
+            adata_pred, adata_gt = histogene_predict(m, test_loader, device=device)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            inference_time_total_s = time.perf_counter() - _t0
 
-    elif mode == "stnet":
-        m = STModel.load_from_checkpoint(
-            ckpt_path, n_genes=n_genes, learning_rate=lr, max_epochs=max_ep)
-        test_loader = DataLoader(test_dataset, batch_size=bs,
-                                 shuffle=False, **eval_loader_options)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        _t0 = time.perf_counter()
-        adata_pred, adata_gt = stnet_predict(m, test_loader, device=device)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        inference_time_total_s = time.perf_counter() - _t0
+        elif mode == "stnet":
+            m = STModel.load_from_checkpoint(
+                ckpt_path, n_genes=n_genes, learning_rate=lr, max_epochs=max_ep)
+            test_loader = DataLoader(test_dataset, batch_size=bs,
+                                     shuffle=False, **eval_loader_options)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            _t0 = time.perf_counter()
+            adata_pred, adata_gt = stnet_predict(m, test_loader, device=device)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            inference_time_total_s = time.perf_counter() - _t0
 
     n_test_spots = adata_pred.shape[0]
     inference_time_per_spot_ms = 1000.0 * inference_time_total_s / max(n_test_spots, 1)
@@ -423,7 +530,11 @@ def run_one(mode, fold, n_genes, lr, max_epochs, batch_size,
           f"({n_test_spots} spot) -> {inference_time_per_spot_ms:.3f} ms/spot")
 
     # ── Common, fair evaluation ───────────────────────────────────────────────
-    g = list(np.load("data/her_hvg_cut_1000.npy", allow_pickle=True))
+    # [BRAIN-ST] dung gene_set cua chinh dataset do (khong co her_hvg_cut_1000.npy)
+    if args.datasets == "brainst":
+        g = list(test_dataset.brain.gene_set)
+    else:
+        g = list(np.load("data/her_hvg_cut_1000.npy", allow_pickle=True))
     adata_visual, metrics = evaluate_her2st_predictions(
         adata_pred, adata_gt, g, label=label, n_clusters=4)
     R, p_values = metrics["R"], metrics["p_values"]
@@ -463,13 +574,17 @@ def run_one(mode, fold, n_genes, lr, max_epochs, batch_size,
                 dpi=300, bbox_inches="tight", transparent=True)
     plt.clf(); plt.close()
 
-    sc.pl.spatial(adata_visual, img=None, color="FASN", spot_size=112,
-                  color_map="magma", frameon=False, legend_loc=None,
-                  title=None, show=False)
-    plt.gca().set_title("")
-    plt.savefig(f"figures/FASN/{mode.upper()}_FASN_fold{fold}.png",
-                dpi=300, bbox_inches="tight", transparent=True)
-    plt.clf(); plt.close()
+    # [BRAIN-ST] FASN co the khong co trong Top250 -> chi ve neu co trong var_names
+    fasn_gene = "FASN" if "FASN" in adata_visual.var_names else (
+        g[0] if g else None)
+    if fasn_gene is not None and fasn_gene in adata_visual.var_names:
+        sc.pl.spatial(adata_visual, img=None, color=fasn_gene, spot_size=112,
+                      color_map="magma", frameon=False, legend_loc=None,
+                      title=None, show=False)
+        plt.gca().set_title("")
+        plt.savefig(f"figures/FASN/{mode.upper()}_FASN_fold{fold}.png",
+                    dpi=300, bbox_inches="tight", transparent=True)
+        plt.clf(); plt.close()
 
     # ── LƯU KẾT QUẢ ──────────────────────────────────────────────────────────
     gene_stats = pd.DataFrame({

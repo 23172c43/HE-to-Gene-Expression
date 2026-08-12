@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.utils.data import Dataset
 from utils import read_tiff
 import numpy as np
 import torchvision
@@ -429,6 +430,193 @@ class LightHGGEP_HER2ST(torch.utils.data.Dataset):
         return meta
 
 
+class LightHGGEP_BRAINST(LightHGGEP_HER2ST):
+    """
+    LightHGGEP dataset tren V1_Adult_Mouse_Brain (scanpy visium_sge).
+
+    Giong het LightHGGEP_HER2ST ve pipeline (patch crop 224, ImageNet norm,
+    exp log-normalize, K-NN graph, section_name/local_idx). Khac:
+      - Anh H&E lay tu adata.uns['spatial'][sid]['images']['hires'] (ndarray,
+        full-res pixel) thay vi doc tu file .tif WSI.
+      - Toa do spot la adata.obsm['spatial'] (full-res pixel) thay vi
+        ['pixel_x','pixel_y'] cua HER2ST.
+      - Chi CO 1 section (mouse brain) nen LOOCV vo nghia -> khong split fold,
+        train/val cat theo slide duy nhat (VAL_SECTION = chinh section do).
+      - Gene list (Top250) tinh tren count matrix giong LightHGGEP_HER2ST_Top250.
+    """
+    def __init__(self, train=True, fold=0, k_neighbors=4, sample_id='V1_Adult_Mouse_Brain'):
+        # KHONG goi super().__init__ vi no doc file HER2ST; setup tu tay nhung
+        # tai dung cac thuoc tinh chung (r, k, transforms, mean/std, gene_list...).
+        self.sample_id = sample_id
+        self.r = 224 // 2
+        self.k = k_neighbors
+        self.train = train
+        self.gene_list = self._select_gene_list()
+        gene_list = self.gene_list
+
+        print('Loading V1_Adult_Mouse_Brain via scanpy ...')
+        self._brain_adata = None
+        meta = self.get_meta(sample_id)   # tai 1 lan, cache
+        self.names = [sample_id]
+        self.id2name = {0: sample_id}
+        self.meta_dict = {sample_id: meta}
+        self.lengths = [len(meta)]
+        self.cumlen = np.cumsum(self.lengths)
+
+        self.label = {sample_id: None}
+        self.lbl2id = {
+            'invasive cancer': 0, 'breast glands': 1, 'immune infiltrate': 2,
+            'cancer in situ': 3, 'connective tissue': 4, 'adipose tissue': 5, 'undetermined': -1,
+        }
+        # BRAINST khong co label -> tat ca -1
+        self.label[sample_id] = torch.full((len(meta),), -1)
+
+        cnt = self.get_cnt(sample_id)
+        self.gene_set = list(gene_list)
+        exp_mat = scp.transform.log(
+            scp.normalize.library_size_normalize(cnt[self.gene_set].values))
+        self.exp_dict = {sample_id: exp_mat}
+
+        # center: full-res pixel tu obsm['spatial']; loc: chinh center (dung lam input)
+        coords = np.asarray(meta.obsm['spatial'], dtype=np.int64)
+        self.center_dict = {sample_id: coords}
+        self.loc_dict = {sample_id: coords.astype(float)}
+
+        self.transforms = transforms.Compose([
+            transforms.ColorJitter(0.5, 0.5, 0.5),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(degrees=180),
+        ])
+        self.mean = [0.485, 0.456, 0.406]
+        self.std = [0.229, 0.224, 0.225]
+
+        self.A_norm_cache = {}
+        self._build_graphs()
+
+    def _select_gene_list(self):
+        # Top 250 gen co mean bieu hien cao nhat tren count matrix (1 section)
+        cnt = self.get_cnt(self.sample_id)
+        gene_means = cnt.mean(axis=0)
+        top = gene_means.sort_values(ascending=False).index[:250].tolist()
+        # dam bao dung 250, khong trung lap
+        seen = []
+        for g in top:
+            if g not in seen:
+                seen.append(g)
+            if len(seen) == 250:
+                break
+        return seen
+
+    def get_img_path(self, name):
+        # BRAINST khong doc file, anh da nam trong self.hires_img
+        return None
+
+    def _load_hires(self):
+        if not hasattr(self, 'hires_img') or self.hires_img is None:
+            adata = self.get_meta(self.sample_id)
+            sid = self.sample_id
+            self.hires_img = np.asarray(
+                adata.uns['spatial'][sid]['images']['hires'], dtype=np.float32)
+            self.hires_scale = adata.uns['spatial'][sid]['scalefactors']['tissue_hires_scalef']
+
+    def _get_img_array(self, name):
+        self._load_hires()
+        return self.hires_img
+
+    def get_cnt(self, name):
+        # name bi voi sample_id; tra ve count matrix tu adata
+        adata = self.get_meta(self.sample_id)
+        cols = list(adata.var_names)
+        # 10x Visium co the co ten gene trung lap -> drop de cnt[gene_set] khong
+        # mo rong them cot (lam lech n_genes). Giu lan xuat hien dau tien.
+        seen = set(); keep = []
+        for j, c in enumerate(cols):
+            if c not in seen:
+                seen.add(c); keep.append(j)
+        mat = adata.X.toarray() if hasattr(adata.X, 'toarray') else adata.X
+        mat = mat[:, keep]
+        uniq = [cols[j] for j in keep]
+        return pd.DataFrame(mat, index=adata.obs.index, columns=uniq)
+
+    def get_pos(self, name):
+        # tra ve DataFrame voi cot x,y la full-res pixel coordinate
+        adata = self.get_meta(self.sample_id)
+        coords = np.asarray(adata.obsm['spatial'], dtype=np.int64)
+        df = pd.DataFrame({'x': coords[:, 0], 'y': coords[:, 1]})
+        df['id'] = [str(coords[i, 0]) + 'x' + str(coords[i, 1]) for i in range(len(coords))]
+        return df
+
+    def get_lbl(self, name):
+        # BRAINST khong co label; tra ve DataFrame rong de ke thua khong crash
+        df = self.get_pos(name).copy()
+        df['label'] = 'undetermined'
+        df.set_index('id', inplace=True)
+        return df
+
+    def get_meta(self, name, gene_list=None):
+        # Cache 1 lan
+        if not hasattr(self, '_brain_adata') or self._brain_adata is None:
+            adata = sc.datasets.visium_sge(sample_id=self.sample_id,
+                                           include_hires_tiff=False)
+            self._brain_adata = adata
+        return self._brain_adata
+
+    def _get_img_cached(self, name):
+        # BRAINST luu anh numpy thay vi PIL; crop truc tiep
+        self._load_hires()
+        return self.hires_img
+
+    def __getitem__(self, index):
+        i = 0
+        while index >= self.cumlen[i]:
+            i += 1
+        idx = index
+        if i > 0:
+            idx = index - self.cumlen[i - 1]
+
+        name = self.id2name[i]
+        exp = self.exp_dict[name][idx]
+        # BRAINST: center la full-res pixel tu obsm['spatial']
+        center = self.center_dict[name][idx]
+        loc = self.loc_dict[name][idx]
+
+        exp = torch.Tensor(exp)
+        loc = torch.Tensor(loc)
+
+        x, y = center
+        # Anh numpy (H, W, 3) float32; crop 224 quanh (x, y)
+        img = self._get_img_cached(name)
+        H, W, _ = img.shape
+        r = self.r
+        x0, y0 = int(round(x * self.hires_scale)), int(round(y * self.hires_scale))
+        x0 = max(0, min(x0, W)) - 0  # clamp ben duoi
+        # crop an toan
+        x0c = max(0, x0 - r); x1c = min(W, x0 + r)
+        y0c = max(0, y0 - r); y1c = min(H, y0 + r)
+        patch = img[y0c:y1c, x0c:x1c, :]
+        # pad neu bien
+        ph = 2 * r - (y1c - y0c); pw = 2 * r - (x1c - x0c)
+        if ph > 0 or pw > 0:
+            patch = np.pad(patch, ((max(0, r - y0c), max(0, (y0c + (y1c - y0c) + r) - H)),
+                                   (max(0, r - x0c), max(0, (x0c + (x1c - x0c) + r) - W)),
+                                   (0, 0)), mode='constant')
+        patch = np.asarray(patch, dtype=np.float32) / 255.0
+        patch = torch.from_numpy(patch.transpose(2, 0, 1)).float()
+        for c in range(3):
+            patch[c] = (patch[c] - self.mean[c]) / self.std[c]
+
+        if self.train:
+            patch = self.transforms(patch)
+
+        section_name = name
+        local_idx = idx
+
+        if self.train:
+            return patch, loc, exp, section_name, local_idx
+        else:
+            return patch, loc, exp, torch.Tensor(center), section_name, local_idx
+
+
 class LightHGGEP_HER2ST_Top250(LightHGGEP_HER2ST):
     """LightHGGEP_HER2ST voi dau ra 250 gen co muc bieu hien trung binh cao nhat.
 
@@ -456,3 +644,68 @@ class LightHGGEP_HER2ST_Top250(LightHGGEP_HER2ST):
                 gene_means[g] = gene_means.get(g, 0.0) + float(cnt[g].mean())
         top = sorted(gene_means.items(), key=lambda kv: kv[1], reverse=True)[:250]
         return [g for g, _ in top]
+
+
+# ============================================================================
+# BRAIN-ST baseline adapters (cho STNet / HisToGene trong run_baselines.py)
+# ============================================================================
+class BRAINSTSpotDataset(Dataset):
+    """Spot-level adapter cho STNet. Tra ve (patch, center, exp).
+
+    Lay patch 224x224 tu LightHGGEP_BRAINST.__getitem__ (bo phan tu
+    section_name/local_idx), tra ve (patch, center, exp) giong HER2ST.__getitem__.
+    """
+    def __init__(self, train=True, k_neighbors=4, seed=42):
+        self.brain = LightHGGEP_BRAINST(train=train, fold=0, k_neighbors=k_neighbors)
+        self.train = train
+        self.rng = random.Random(seed)
+        self.indices = list(range(len(self.brain)))
+        if self.train:
+            self.rng.shuffle(self.indices)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, index):
+        bi = self.indices[index]
+        item = self.brain[bi]
+        # LightHGGEP_BRAINST.__getitem__ tra ve 5 (train) / 6 (test) items:
+        # (patch, loc, exp, [center,] section_name, local_idx)
+        patch = item[0]
+        exp = item[2]
+        center = item[3] if not self.train else item[1]  # test co center o idx3; train center=loc
+        if self.train:
+            center = item[1]
+        else:
+            center = item[3]
+        return patch, center, exp
+
+
+class BRAINSTSlideDataset(Dataset):
+    """Slide-level adapter cho HisToGene. Tra ve (patches_flat, centers_clamped, exp).
+
+    Giong HisToGeneSlideDataset: gom toan bo spot cua 1 section thanh 1 item,
+    crop 224->112 o trung tam, flatten patch, clamp center ve [0,63].
+    """
+    def __init__(self, spot_dataset, indices=None):
+        self.spot_dataset = spot_dataset
+        # Section chi co 1, lay toan bo indices
+        self.indices = indices if indices is not None else list(range(len(spot_dataset)))
+
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, index):
+        patches, locations, expressions = [], [], []
+        for si in self.indices:
+            item = self.spot_dataset[si]
+            patch = item[0]
+            loc = item[1]
+            exp = item[2]
+            h, w = patch.shape[-2:]
+            top, left = (h - 112) // 2, (w - 112) // 2
+            patch = patch[:, top:top + 112, left:left + 112]
+            patches.append(patch.flatten())
+            locations.append(loc.long().clamp(0, 63))
+            expressions.append(exp)
+        return (torch.stack(patches), torch.stack(locations), torch.stack(expressions))
