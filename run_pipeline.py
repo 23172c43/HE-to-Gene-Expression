@@ -175,9 +175,24 @@ _p.add_argument('--skip-train', action='store_true',
 _p.add_argument('--cnn-chunk', type=int, default=None,
                 help="So patch xu ly dong thoi qua CNN (Stage1-3). Mac dinh = BATCH_SIZE "
                      "neu khong truyen. Giam gia tri nay de giam peak memory.")
+_p.add_argument('--ablation', choices=['full', 'no_graph', 'no_cross_scale', 'no_depthwise'],
+                default='full',
+                help="Ablation study: 'full' = day du 3 thanh phan; "
+                     "'no_graph' = bo Spatial SGC; "
+                     "'no_cross_scale' = bo cross-scale fusion (chi dung scale cuoi); "
+                     "'no_depthwise' = thay depthwise separable bang Conv2d thuong.")
 _args = _p.parse_args()
 DATASET = _args.datasets
 SKIP_TRAIN = _args.skip_train
+ABLATION = _args.ablation
+# Map ablation name -> 3 co cua model
+ABLATION_FLAGS = {
+    'full':           dict(use_graph=True,  use_cross_scale=True,  depthwise=True),
+    'no_graph':       dict(use_graph=False, use_cross_scale=True,  depthwise=True),
+    'no_cross_scale': dict(use_graph=True,  use_cross_scale=False, depthwise=True),
+    'no_depthwise':   dict(use_graph=True,  use_cross_scale=True,  depthwise=False),
+}
+ABL_FLAGS = ABLATION_FLAGS[ABLATION]
 N_GENES = None  # tu dong lay tu dataset gene_set neu de None
 MAX_EPOCHS = 100
 PATIENCE = 15
@@ -466,6 +481,7 @@ def run_fold(fold):
         learning_rate=LEARNING_RATE,
         max_epochs=MAX_EPOCHS,
         cnn_chunk=CNN_CHUNK,
+        **ABL_FLAGS,
     )
 
     # Set graph cho model
@@ -545,7 +561,8 @@ def run_fold(fold):
             k_neighbors=K_NEIGHBORS,
             learning_rate=LEARNING_RATE,
             max_epochs=MAX_EPOCHS,
-            cnn_chunk=CNN_CHUNK
+            cnn_chunk=CNN_CHUNK,
+            **ABL_FLAGS,
         )
     else:
         # [MỚI] Chỉ đo peak memory / thời gian suy luận: dùng đúng kiến trúc + đúng
@@ -732,6 +749,7 @@ def run_fold(fold):
     # ----- Cell 31 (notebook gốc): results row (TRẢ VỀ, không ghi đè) -----
     row = {
         'model':          'Light-HGGEP',
+        'ablation':       ABLATION,
         'fold':           FOLD,
         'val_section':    VAL_SECTION,
         'test_section':   test_dataset.names[0],

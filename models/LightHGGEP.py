@@ -33,41 +33,59 @@ class LightHGGEP(pl.LightningModule):
     4. Spatial SGC: K-NN graph + D^(-1/2) A D^(-1/2) + 2 layers
     5. Prediction Head: Linear(128 -> n_genes)
     """
-    def __init__(self, n_genes=785, k_neighbors=4, learning_rate=1e-4, max_epochs=100, cnn_chunk=64):
+    def __init__(self, n_genes=785, k_neighbors=4, learning_rate=1e-4, max_epochs=100, cnn_chunk=64,
+                 use_graph=True, use_cross_scale=True, depthwise=True):
         super().__init__()
         self.save_hyperparameters()
-        
+
         self.n_genes = n_genes
         self.k_neighbors = k_neighbors
         self.learning_rate = learning_rate
         self.max_epochs = max_epochs
         self.cnn_chunk = cnn_chunk  # sẽ được set lại ngay dưới nếu bạn truyền vào
+        self.use_graph = use_graph          # False -> ablation: bo Spatial SGC
+        self.use_cross_scale = use_cross_scale  # False -> ablation: chi dung scale cuoi (stage3)
+        self.depthwise = depthwise          # False -> ablation: dung Conv2d thuong thay depthwise separable
+
+        # Chon loai conv block -- depthwise separable hay Conv2d thong thuong
+        def _conv_block(in_ch, out_ch):
+            if self.depthwise:
+                return DepthwiseSeparableConv(in_ch, out_ch, kernel_size=3, padding=1)
+            return nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True),
+            )
+
         # Stage 1: Low-level (nuclei features)
         self.stage1 = nn.Sequential(
-            DepthwiseSeparableConv(3, 64, kernel_size=3, padding=1),
+            _conv_block(3, 64),
             nn.MaxPool2d(2)
         )
-        
+
         # Stage 2: Mid-level (tissue structure)
         self.stage2 = nn.Sequential(
-            DepthwiseSeparableConv(64, 64, kernel_size=3, padding=1),
+            _conv_block(64, 64),
             nn.MaxPool2d(2)
         )
-        
+
         # Stage 3: High-level (micro-environment)
         self.stage3 = nn.Sequential(
-            DepthwiseSeparableConv(64, 64, kernel_size=3, padding=1),
+            _conv_block(64, 64),
             nn.MaxPool2d(2)
         )
-        
+
         self.gap = nn.AdaptiveAvgPool2d(1)
-        
+
         # Cross-Scale Fusion (Eq. 1)
-        self.cross_scale_fusion = nn.Linear(64 * 3, 128)
-        
+        # Dung chieu dai diet cua feature roi vao fusion: full = 3 scale (192);
+        # chi scale cuoi = 64
+        self.fusion_in_features = (64 * 3) if self.use_cross_scale else 64
+        self.cross_scale_fusion = nn.Linear(self.fusion_in_features, 128)
+
         # Spatial SGC Weight (Eq. 2)
         self.sgc_weight = nn.Linear(128, 128, bias=False)
-        
+
         # Prediction Head (Eq. 3)
         self.pred_head = nn.Linear(128, n_genes)
         
@@ -142,12 +160,17 @@ class LightHGGEP(pl.LightningModule):
             f2_gap = self.gap(f2).view(xb.size(0), -1)
             f3 = self.stage3(f2)
             f3_gap = self.gap(f3).view(xb.size(0), -1)
-            z_b = torch.cat([f1_gap, f2_gap, f3_gap], dim=1)
+            if self.use_cross_scale:
+                z_b = torch.cat([f1_gap, f2_gap, f3_gap], dim=1)
+            else:
+                # Ablation: bo cross-scale fusion, chi dung feature scale cuoi.
+                z_b = f3_gap
             z_spot_chunks.append(self.cross_scale_fusion(z_b))
         z_spot = torch.cat(z_spot_chunks, dim=0)   # (N, 128) -- ĐỦ cả section, không bị cắt
     
-        # Spatial SGC (Eq. 2) -- logic KHÔNG đổi, chỉ khác input z_spot giờ đủ N
-        if section_name is not None and section_name in self.A_norm_cache:
+        # Spatial SGC (Eq. 2)
+        # Ablation `use_graph=False`: bo nhanh SGC, dau ra = feature CNN truc tiep.
+        if self.use_graph and section_name is not None and section_name in self.A_norm_cache:
             A_norm_full = self.A_norm_cache[section_name]
             A_norm_full = A_norm_full.to(x.device)
             if local_indices is not None:
