@@ -181,6 +181,9 @@ _p.add_argument('--ablation', choices=['full', 'no_graph', 'no_cross_scale', 'no
                      "'no_graph' = bo Spatial SGC; "
                      "'no_cross_scale' = bo cross-scale fusion (chi dung scale cuoi); "
                      "'no_depthwise' = thay depthwise separable bang Conv2d thuong.")
+_p.add_argument('--k', type=int, default=4,
+                help="So lang gieng gan nhat (k) cho do thi K-NN trong Spatial SGC. "
+                     "Mac dinh 4. Loi khuyen: chay k trong {2,4,8,12,16} de khao sat.")
 _args = _p.parse_args()
 DATASET = _args.datasets
 SKIP_TRAIN = _args.skip_train
@@ -197,7 +200,7 @@ N_GENES = None  # tu dong lay tu dataset gene_set neu de None
 MAX_EPOCHS = 100
 PATIENCE = 15
 LEARNING_RATE = 1e-4
-K_NEIGHBORS = 4
+K_NEIGHBORS = _args.k
 BATCH_SIZE = 32  # Light-HGGEP rat nhe nen co the tang batch size
 CNN_CHUNK = _args.cnn_chunk if _args.cnn_chunk is not None else BATCH_SIZE
 NUM_WORKERS = 2  # per DDP rank (4 loader workers total with 2 GPUs)
@@ -750,6 +753,7 @@ def run_fold(fold):
     row = {
         'model':          'Light-HGGEP',
         'ablation':       ABLATION,
+        'k_neighbors':    K_NEIGHBORS,
         'fold':           FOLD,
         'val_section':    VAL_SECTION,
         'test_section':   test_dataset.names[0],
