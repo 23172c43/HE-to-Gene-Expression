@@ -557,35 +557,83 @@ class LightHGGEP_HER2ST_Top250(LightHGGEP_HER2ST):
 
 
 class LightHGGEP_HEST_h5py(torch.utils.data.Dataset):
-    """Dataset cho external validation HEST: doc file .h5ad truc tiep bang h5py
-    (KHONG dung scanpy), khong co nhan mo hoc (label=None -> ARI/NMI NaN).
+    """Dataset HEST (.h5ad) cho Light-HGGEP, dạng GỘP nhiều mẫu theo kiểu
+    LightHGGEP_HER2ST — dùng để TRAIN từ đầu trên HEST theo Leave-One-Patient-Out
+    (LOPO): mỗi file .h5ad = 1 mẫu (patient), fold chọn 1 mẫu làm test, phần còn
+    lại là train (validation = mẫu train alphabet đầu, do script train quyết định
+    qua SectionBatchSampler include/exclude).
 
-    Moi file .h5ad = 1 sample = 1 graph K-NN rieng (ko gop xuyen mau).
-    Gene target luon giu du (gene_list, 785) -- gene vang mat trong sample duoc
-    dien 0 de khop shape (N, n_genes) voi ckpt; luc TINH DIEM script ben ngoai
-    se loai bo cac cot toan-0 (xem run_hest_pipeline.py).
+    Đọc .h5ad trực tiếp bằng h5py + scipy.sparse (KHÔNG scanpy). Gene target giữ
+    đủ (gene_list, 785); gene vắng mặt trong mẫu được điền 0 để shape (N,785)
+    khớp model. Khi tính điểm, script phải loại cột toàn-0 (xem run_hest_train.py).
 
-    __getitem__ tra TEST-tuple 6 phan tu dung thu tu section_collate_fn:
-        (patch_3ch, loc, exp, center, section_name, local_idx)
+    __getitem__: train trả tuple 5, test trả tuple 6 — khớp section_collate_fn:
+        train: (patch_3ch, loc, exp, section_name, local_idx)
+        test : (patch_3ch, loc, exp, center, section_name, local_idx)
     """
-    def __init__(self, h5ad_path, gene_list, k_neighbors=4, patch_size=224):
+    def __init__(self, h5_dir, gene_list, train=True, fold=0, k_neighbors=4,
+                 patch_size=224):
+        super(LightHGGEP_HEST_h5py, self).__init__()
+        self.h5_dir = h5_dir
         self.k = k_neighbors
         self.patch_size = patch_size
         self.target_genes = list(gene_list)
-        self.sample_name = os.path.basename(h5ad_path).split('.')[0]
+        self.gene_set = list(gene_list)
+        self.train = train
 
         self.mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
         self.std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
 
-        with h5py.File(h5ad_path, 'r') as f:
-            # --- var: ten gen ---
+        # Danh sách mẫu (tên file không đuôi) — mỗi mẫu = 1 patient
+        paths = sorted(glob.glob(os.path.join(h5_dir, '*.h5ad')))
+        if not paths:
+            raise FileNotFoundError(f"Không tìm thấy *.h5ad trong {h5_dir}")
+        all_samples = sorted(os.path.basename(p).split('.')[0] for p in paths)
+
+        # Leave-One-Patient-Out: fold -> mẫu test
+        test_sample = all_samples[fold % len(all_samples)]
+        te_names = [s for s in all_samples if s == test_sample]
+        tr_names = [s for s in all_samples if s != test_sample]
+
+        print(f"HEST LOPO Split - Test: {test_sample} | Train: {len(tr_names)} | "
+              f"Test: {len(te_names)} | tổng {len(all_samples)} mẫu")
+        self.names = te_names if not train else tr_names
+
+        # Load metadata từng mẫu (giữ import h5py/sp ở module-level)
+        self.meta_dict = {n: self._load_sample(n) for n in self.names}
+
+        self.exp_dict = {n: m['exp'] for n, m in self.meta_dict.items()}
+        self.center_dict = {n: m['center'] for n, m in self.meta_dict.items()}
+        self.loc_dict = {n: m['loc'] for n, m in self.meta_dict.items()}
+        self.img_dict = {n: m['img'] for n, m in self.meta_dict.items()}
+        self.r_img = next(iter(self.meta_dict.values()))['r_img']
+
+        self.lengths = [len(m['loc']) for m in self.meta_dict.values()]
+        self.cumlen = np.cumsum(self.lengths)
+        self.id2name = dict(enumerate(self.names))
+
+        # Augment khi train (áp lên patch đã crop, kiểu HER2ST)
+        self.transforms = transforms.Compose([
+            transforms.ColorJitter(0.5, 0.5, 0.5),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(degrees=180),
+        ])
+
+        # Build K-NN graph riêng từng mẫu
+        self.A_norm_cache = {}
+        self._build_graphs()
+
+    def _load_sample(self, name):
+        """Đọc 1 file .h5ad -> dict: exp, loc, center, img, r_img."""
+        path = os.path.join(self.h5_dir, name + '.h5ad')
+        import json
+        with h5py.File(path, 'r') as f:
             var_group = f['var']
             index_col = var_group.attrs.get('_index', '_index')
             raw_genes = var_group[index_col][:]
             var_names = np.array([g.decode('utf-8') if isinstance(g, bytes) else g
                                   for g in raw_genes])
 
-            # --- X: ma tran bieu hien gen (csr hoac dense) ---
             X_node = f['X']
             shape = tuple(X_node.attrs.get('shape')) if 'shape' in X_node.attrs else None
             if isinstance(X_node, h5py.Group) and 'data' in X_node:
@@ -599,123 +647,123 @@ class LightHGGEP_HEST_h5py(torch.utils.data.Dataset):
                     X_matrix = X_matrix.tocsr()
             N = X_matrix.shape[0]
 
-            # --- exp: giu du gene_list, gene thieu -> cot 0 ---
+            # exp: giữ đủ gene_list, gene thiếu -> cột 0
             gene2col = {g: i for i, g in enumerate(var_names)}
             spot_sums = np.asarray(X_matrix.sum(axis=1)).flatten()
             spot_sums[spot_sums == 0] = 1.0
             exp = np.zeros((N, len(self.target_genes)), dtype=np.float32)
-            common_count = 0
+            common = 0
             for j, g in enumerate(self.target_genes):
                 col = gene2col.get(g)
                 if col is None:
-                    continue  # gene vang mat trong HEST -> giu cot 0
+                    continue
                 col_vec = X_matrix[:, col].toarray().flatten()
                 exp[:, j] = np.log1p((col_vec / spot_sums) * 1e6)
-                common_count += 1
-            self.exp = exp
-            self.n_genes_present = common_count
-            print(f"[HEST] {self.sample_name}: {common_count}/{len(self.target_genes)} gene co mat; N={N} spot")
+                common += 1
+            print(f"[HEST] {name}: {common}/{len(self.target_genes)} gene có mặt; N={N}")
 
-            # --- coords (raw, chua nhan scale) ---
-            self.coords = np.asarray(f['obsm']['spatial'][:], dtype=np.float64)
+            coords = np.asarray(f['obsm']['spatial'][:], dtype=np.float64)
 
-            # --- anh + scale factors ---
             spatial_grp = f['uns']['spatial']
             internal_id = list(spatial_grp.keys())[0]
             sf_grp = spatial_grp[internal_id]['scalefactors']
-            # scalefactors co the la group hoac dataset JSON string
             if isinstance(sf_grp, h5py.Group):
                 scale = sf_grp['tissue_downscaled_fullres_scalef'][()]
                 spot_dia = sf_grp['spot_diameter_fullres'][()]
             else:
-                import json
-                sf_json = json.loads(sf_grp[()] if isinstance(sf_grp[()], bytes) else sf_grp[()])
+                raw = sf_grp[()]
+                sf_json = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
                 scale = sf_json['tissue_downscaled_fullres_scalef']
                 spot_dia = sf_json['spot_diameter_fullres']
-            self.scale = float(scale)
+            scale = float(scale)
 
             imgs_grp = spatial_grp[internal_id]['images']
-            if 'downscaled_fullres' in imgs_grp:
-                img = imgs_grp['downscaled_fullres'][:]
-            else:
-                img = imgs_grp['hires'][:]
+            img = imgs_grp['downscaled_fullres'][:] if 'downscaled_fullres' in imgs_grp \
+                else imgs_grp['hires'][:]
             img = np.asarray(img)
             if img.ndim == 3 and img.shape[-1] == 4:
                 img = img[..., :3]
             if img.max() <= 1.0:
                 img = (img * 255.0).astype(np.uint8)
-            self.img = np.ascontiguousarray(img)   # (H, W, 3) uint8
+            img = np.ascontiguousarray(img)
 
-            self.r_img = int(round(float(spot_dia) * self.scale * 0.75))
-            if self.r_img < 1:
-                self.r_img = 1
+            r_img = int(round(float(spot_dia) * scale * 0.75))
+            if r_img < 1:
+                r_img = 1
 
-        # pixel center = coords * scale; loc = coords raw (build graph)
-        self.center_dict = np.floor(self.coords * self.scale).astype(int)
-        self.loc_dict = self.coords
+        return {
+            'exp': exp,
+            'loc': coords,
+            'center': np.floor(coords * scale).astype(int),
+            'img': img,
+            'r_img': r_img,
+        }
 
-        # Thuoc tinh bat buoc cho SectionBatchSampler / get_section_ids
-        self.id2name = {0: self.sample_name}
-        self.lengths = [N]
-        self.gene_set = list(self.target_genes)
-        self.cumlen = np.cumsum(self.lengths)
-
-        # Graph K-NN rieng cho sample nay
-        self.A_norm_cache = {}
-        self._build_graph()
-
-    def _build_graph(self):
-        N = len(self.coords)
-        if N < 2:
-            self.A_norm_cache[self.sample_name] = np.eye(1, dtype=np.float32)
-            return
-        D = pairwise_distances(self.coords, metric='euclidean')
-        k_eff = min(self.k, N - 1)
-        A = np.zeros((N, N), dtype=np.float32)
-        for i in range(N):
-            order = np.argsort(D[i])
-            order = order[order != i][:k_eff]
-            A[i, order] = 1.0
-        A_tilde = A + np.eye(N, dtype=np.float32)
-        D_hat = np.diag(np.sum(A_tilde, axis=1) ** (-0.5))
-        D_hat[np.isinf(D_hat)] = 0
-        self.A_norm_cache[self.sample_name] = (D_hat @ A_tilde @ D_hat).astype(np.float32)
-
-    def preprocess_3ch(self, patch_rgb):
-        patch_resized = cv2.resize(patch_rgb, (self.patch_size, self.patch_size),
-                                   interpolation=cv2.INTER_CUBIC)
-        patch_tensor = patch_resized.transpose(2, 0, 1).astype(np.float32) / 255.0
-        for c in range(3):
-            patch_tensor[c] = (patch_tensor[c] - self.mean[c][0][0]) / self.std[c][0][0]
-        return torch.from_numpy(patch_tensor).float()
+    def _build_graphs(self):
+        for name, meta in self.meta_dict.items():
+            coords = meta['loc']
+            N = len(coords)
+            if N < 2:
+                self.A_norm_cache[name] = np.eye(1, dtype=np.float32)
+                continue
+            D = pairwise_distances(coords, metric='euclidean')
+            k_eff = min(self.k, N - 1)
+            A = np.zeros((N, N), dtype=np.float32)
+            for i in range(N):
+                order = np.argsort(D[i])
+                order = order[order != i][:k_eff]
+                A[i, order] = 1.0
+            A_tilde = A + np.eye(N, dtype=np.float32)
+            D_hat = np.diag(np.sum(A_tilde, axis=1) ** (-0.5))
+            D_hat[np.isinf(D_hat)] = 0
+            self.A_norm_cache[name] = (D_hat @ A_tilde @ D_hat).astype(np.float32)
 
     def __len__(self):
-        return len(self.coords)
+        return self.cumlen[-1]
 
-    def __getitem__(self, idx):
-        x, y = self.center_dict[idx]
-        h, w, _ = self.img.shape
-        r = self.r_img
-
+    def _crop_patch(self, name, idx):
+        meta = self.meta_dict[name]
+        r = meta['r_img']
+        x, y = meta['center'][idx]
+        h, w, _ = meta['img'].shape
         top, bottom = y - r, y + r
         left, right = x - r, x + r
-
-        # Crop voi vien: doi voi phan ngoai anh, dung mode='edge'
-        crop = self.img[max(top, 0):min(bottom, h), max(left, 0):min(right, w)]
-        pad_top = max(-top, 0)
-        pad_bottom = max(bottom - h, 0)
-        pad_left = max(-left, 0)
-        pad_right = max(right - w, 0)
+        crop = meta['img'][max(top, 0):min(bottom, h), max(left, 0):min(right, w)]
+        pad_top = max(-top, 0); pad_bottom = max(bottom - h, 0)
+        pad_left = max(-left, 0); pad_right = max(right - w, 0)
         if pad_top or pad_bottom or pad_left or pad_right:
             crop = cv2.copyMakeBorder(crop, pad_top, pad_bottom, pad_left, pad_right,
                                       cv2.BORDER_REPLICATE)
-        # clip ve dung kich thuoc 2r x 2r (de phong truong hop spot cham dinh)
         crop = crop[:2 * r, :2 * r]
+        if self.train:
+            # augment trên ảnh uint8 trước khi chuẩn hóa (dùng torchvision trên tensor)
+            from PIL import Image
+            crop = np.array(self.transforms(Image.fromarray(crop)))
+        resized = cv2.resize(crop, (self.patch_size, self.patch_size),
+                             interpolation=cv2.INTER_CUBIC)
+        t = resized.transpose(2, 0, 1).astype(np.float32) / 255.0
+        for c in range(3):
+            t[c] = (t[c] - self.mean[c][0][0]) / self.std[c][0][0]
+        return torch.from_numpy(t).float()
 
-        patch_3ch = self.preprocess_3ch(crop)
-        loc = torch.tensor(self.coords[idx], dtype=torch.float32)
-        exp = torch.tensor(self.exp[idx], dtype=torch.float32)
-        center = torch.tensor(self.center_dict[idx], dtype=torch.float32)
-        section_name = self.sample_name
-        local_idx = idx
-        return patch_3ch, loc, exp, center, section_name, local_idx
+    def __getitem__(self, index):
+        i = 0
+        while index >= self.cumlen[i]:
+            i += 1
+        idx = index
+        if i > 0:
+            idx = index - self.cumlen[i - 1]
+
+        name = self.id2name[i]
+        pat = self._crop_patch(name, idx)
+        exp = self.exp_dict[name][idx]
+        loc = self.loc_dict[name][idx]
+        center = self.center_dict[name][idx]
+
+        exp_t = torch.tensor(exp, dtype=torch.float32)
+        loc_t = torch.tensor(loc, dtype=torch.float32)
+        center_t = torch.tensor(center, dtype=torch.float32)
+        if self.train:
+            return pat, loc_t, exp_t, name, idx
+        else:
+            return pat, loc_t, exp_t, center_t, name, idx
