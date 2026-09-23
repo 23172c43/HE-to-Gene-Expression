@@ -218,6 +218,13 @@ def main():
     if not all_samples:
         raise FileNotFoundError(f"Không tìm thấy *.h5ad trong {args.hest_dir}")
     n_fold = args.fold_end if args.fold_end is not None else len(all_samples)
+    n_max = len(all_samples)
+    if n_fold > n_max:
+        print(f"[WARN] --fold-end={n_fold} vượt số mẫu ({n_max}). Giới hạn xuống {n_max} "
+              f"(và fold-start lên {args.fold_start}..{n_max - 1}).")
+        n_fold = n_max
+    if args.fold_start >= n_max:
+        raise SystemExit(f"[LỖI] --fold-start={args.fold_start} >= số mẫu {n_max} — không có gì để chạy.")
     print(f"Tổng {len(all_samples)} mẫu → chạy fold {args.fold_start}..{n_fold - 1}")
 
     import pandas as pd

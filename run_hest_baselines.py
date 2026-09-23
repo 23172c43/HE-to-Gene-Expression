@@ -147,6 +147,12 @@ def main():
     if not all_samples:
         raise FileNotFoundError(f"Không có *.h5ad trong {args.hest_dir}")
     n_fold = args.fold_end if args.fold_end is not None else len(all_samples)
+    n_max = len(all_samples)
+    if n_fold > n_max:
+        print(f"[WARN] --fold-end={n_fold} vượt số mẫu ({n_max}). Giới hạn xuống {n_max}.")
+        n_fold = n_max
+    if args.fold_start >= n_max:
+        raise SystemExit(f"[LỖI] --fold-start={args.fold_start} >= số mẫu {n_max} — không có gì để chạy.")
     modes = ['stnet', 'histogene'] if args.mode == 'all' else [args.mode]
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
