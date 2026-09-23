@@ -66,8 +66,13 @@ def comp_umap(adata):
     return adata
 
 def comp_tsne_km(adata,k=10):
-    sc.pp.pca(adata)
-    sc.tl.tsne(adata)
+    """Thay sc.pp.pca + sc.tl.tsne bằng sklearn (ko phụ thuộc scanpy)."""
+    from sklearn.decomposition import PCA
+    from sklearn.manifold import TSNE
+    X = np.asarray(adata.X, dtype=np.float64)
+    pca = PCA(n_components=min(50, X.shape[0], X.shape[1]), random_state=0).fit_transform(X)
+    tsne = TSNE(n_components=2, random_state=0).fit_transform(pca)
+    adata.obsm['X_pca'] = tsne.astype(np.float32)
     kmeans = KMeans(n_clusters=k, init="k-means++", random_state=0).fit(adata.obsm['X_pca'])
     adata.obs['kmeans'] = kmeans.labels_.astype(str)
     return adata

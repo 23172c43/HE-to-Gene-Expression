@@ -1,7 +1,6 @@
 """Shared, leakage-free HER2ST evaluation protocol."""
 
 import numpy as np
-import scanpy as sc
 
 from predict import (get_R, get_MSE, get_MAE, get_Spearman, get_MoransI_all,
                      cluster_with_nmi)
@@ -41,7 +40,13 @@ def evaluate_her2st_predictions(adata_pred, adata_gt, genes, label=None,
     morans = get_MoransI_all(adata_pred, adata_gt, top_k=50, section_ids=section_ids)
 
     adata_visual = adata_pred.copy()
-    sc.pp.scale(adata_visual)
+    # Thay sc.pp.scale bằng z-score numpy (ko phụ thuộc scanpy). Chuẩn hóa từng
+    # gene (cột) theo mean/std; gene ko biến thiên (std=0) giữ nguyên 0.
+    X = np.asarray(adata_visual.X, dtype=np.float64)
+    mean = X.mean(axis=0, keepdims=True)
+    std = X.std(axis=0, ddof=1, keepdims=True)
+    std[std == 0] = 1.0
+    adata_visual.X = ((X - mean) / std).astype(np.float32)
     adata_visual = comp_tsne_km(adata_visual, n_clusters)
     if label is None:
         ARI = NMI = float("nan")

@@ -1,6 +1,5 @@
 import torch
 from torch.utils.data import DataLoader
-from utils import *
 import warnings
 from tqdm import tqdm
 warnings.filterwarnings('ignore')
@@ -8,6 +7,8 @@ from scipy.stats import pearsonr, spearmanr
 from sklearn.metrics import adjusted_rand_score as ari_score
 from sklearn.metrics import normalized_mutual_info_score as nmi_score
 from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.cluster import KMeans
+import anndata as ann
 
 MODEL_PATH = ''
 
@@ -116,12 +117,23 @@ def get_R(data1,data2,dim=1,func=pearsonr,section_ids=None):
     p1=np.array(p1)
     return r1,p1
 
+def _full_pca_tsne(tmp):
+    """Thay sc.pp.pca + sc.tl.tsne bằng sklearn (ko phụ thuộc scanpy).
+    Gán adata.obsm['X_pca'] = PCA, rồi t-SNE. Tái dùng cho cluster() và
+    cluster_with_nmi()."""
+    from sklearn.decomposition import PCA
+    from sklearn.manifold import TSNE
+    X = np.asarray(tmp.X, dtype=np.float64)
+    pca = PCA(n_components=min(50, X.shape[0], X.shape[1]), random_state=0).fit_transform(X)
+    tsne = TSNE(n_components=2, random_state=0).fit_transform(pca)
+    tmp.obsm['X_pca'] = tsne.astype(np.float32)
+
+
 def cluster(adata,label):
     idx=label!='undetermined'
     tmp=adata[idx]
     l=label[idx]
-    sc.pp.pca(tmp)
-    sc.tl.tsne(tmp)
+    _full_pca_tsne(tmp)
     kmeans = KMeans(n_clusters=len(set(l)), init="k-means++", random_state=0).fit(tmp.obsm['X_pca'])
     p=kmeans.labels_.astype(str)
     lbl=np.full(len(adata),str(len(set(l))))
@@ -359,8 +371,7 @@ def cluster_with_nmi(adata, label):
     l   = label[idx]
     if len(l) < 2 or len(np.unique(l)) < 2:
         return np.array([], dtype=str), float('nan'), float('nan')
-    sc.pp.pca(tmp)
-    sc.tl.tsne(tmp)
+    _full_pca_tsne(tmp)
     kmeans = KMeans(n_clusters=len(set(l)), init="k-means++", random_state=0).fit(tmp.obsm['X_pca'])
     p = kmeans.labels_.astype(str)
 
