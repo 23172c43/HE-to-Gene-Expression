@@ -28,7 +28,7 @@ warnings.filterwarnings('ignore')
 
 from dataset import LightHGGEP_HEST_h5py
 from predict import stnet_predict, histogene_predict, get_section_ids
-from predict import get_R, get_Spearman, get_MSE, get_MAE
+from predict import get_R, get_Spearman, get_MSE, get_MAE, get_MoransI_all
 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
@@ -250,6 +250,12 @@ def main():
                                           fold=fold, k=args.k, patch_size=args.patch_size)
             ds_test_raw = ds_test.ds
 
+            # Đo thời gian + peak memory cho inference (giống run_pipeline)
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats(device)
+                torch.cuda.synchronize()
+            _t0 = time.perf_counter()
+
             if mode == 'histogene':
                 from models.HisToGene_model import HisToGene
                 m = HisToGene.load_from_checkpoint(best_ckpt, patch_size=_HISTO_PATCH,
@@ -268,6 +274,12 @@ def main():
                                          num_workers=args.num_workers)
                 adata_pred, adata_gt = stnet_predict(m, test_loader, device=device)
 
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            inference_time_total_s = time.perf_counter() - _t0
+            peak_inference_memory_mb = (torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                                         if torch.cuda.is_available() else float('nan'))
+
             # ---- METRIC ----
             mask = np.abs(adata_gt.X).max(axis=0) > 0
             mask = np.array(mask).flatten()
@@ -281,15 +293,25 @@ def main():
             rho, _ = get_Spearman(ap, ag, section_ids=section_ids)
             mse = get_MSE(ap, ag, section_ids=section_ids)
             mae = get_MAE(ap, ag, section_ids=section_ids)
+            morans = get_MoransI_all(ap, ag, top_k=50, section_ids=section_ids)
+
+            n_spots = adata_pred.shape[0]
+            total_params = sum(p.numel() for p in m.parameters())
 
             rows.append({
                 'mode': mode, 'fold': fold, 'test_sample': test_sample,
                 'val_sample': val_name, 'n_train_samples': len(ds_train.ds.names),
-                'n_test_spots': adata_pred.shape[0], 'n_genes_eval': n_genes_eval,
+                'n_test_spots': n_spots, 'n_genes_eval': n_genes_eval,
                 'pearson': float(np.nanmean(R)),
                 'spearman': float(np.nanmean(rho)),
                 'rmse': float(np.nanmean(np.sqrt(mse))),
                 'mae': float(np.nanmean(mae)),
+                'morans_i_pred': float(np.nanmean(morans['pred'])),
+                'morans_i_gt': float(np.nanmean(morans['gt'])),
+                'params': total_params,
+                'inference_time_total_s': inference_time_total_s,
+                'inference_time_per_spot_ms': 1000.0 * inference_time_total_s / max(n_spots, 1),
+                'peak_inference_memory_mb': peak_inference_memory_mb,
                 'best_val_loss': best_val,
             })
             print(f"  n_spots={adata_pred.shape[0]} | n_genes_eval={n_genes_eval} | "

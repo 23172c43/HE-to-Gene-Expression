@@ -24,7 +24,8 @@ warnings.filterwarnings('ignore')
 
 from dataset import LightHGGEP_HEST_h5py
 from models.LightHGGEP import LightHGGEP
-from predict import lighthggep_predict, get_section_ids, get_R, get_Spearman, get_MSE, get_MAE
+from predict import (lighthggep_predict, get_section_ids, get_R, get_Spearman,
+                     get_MSE, get_MAE, get_MoransI_all)
 from sampler_utils import SectionBatchSampler, section_collate_fn
 
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, Callback
@@ -155,7 +156,17 @@ def run_fold(fold, args, gene_list):
                              collate_fn=section_collate_fn, num_workers=args.num_workers,
                              pin_memory=torch.cuda.is_available())
 
+    # Đo thời gian + peak memory cho inference (giống run_pipeline)
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.synchronize()
+    _t0 = time.perf_counter()
     adata_pred, adata_gt = lighthggep_predict(best_model, test_loader, device=device)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    inference_time_total_s = time.perf_counter() - _t0
+    peak_inference_memory_mb = (torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                                 if torch.cuda.is_available() else float('nan'))
 
     # Loại cột toàn-0 (gene vắng / không phát hiện) khỏi metric
     mask = np.array((np.abs(adata_gt.X).max(axis=0) > 0)).flatten()
@@ -169,18 +180,28 @@ def run_fold(fold, args, gene_list):
     rho, _ = get_Spearman(ap, ag, section_ids=section_ids)
     mse = get_MSE(ap, ag, section_ids=section_ids)
     mae = get_MAE(ap, ag, section_ids=section_ids)
+    morans = get_MoransI_all(ap, ag, top_k=50, section_ids=section_ids)
+
+    n_spots = adata_pred.shape[0]
+    total_params = sum(p.numel() for p in best_model.parameters())
 
     return {
         'fold': fold,
         'test_sample': TEST_SECTION,
         'val_sample': VAL_SECTION,
         'n_train_samples': len(train_dataset.names),
-        'n_test_spots': adata_pred.shape[0],
+        'n_test_spots': n_spots,
         'n_genes_eval': n_genes_eval,
         'pearson': float(np.nanmean(R)),
         'spearman': float(np.nanmean(rho)),
         'rmse': float(np.nanmean(np.sqrt(mse))),
         'mae': float(np.nanmean(mae)),
+        'morans_i_pred': float(np.nanmean(morans['pred'])),
+        'morans_i_gt': float(np.nanmean(morans['gt'])),
+        'params': total_params,
+        'inference_time_total_s': inference_time_total_s,
+        'inference_time_per_spot_ms': 1000.0 * inference_time_total_s / max(n_spots, 1),
+        'peak_inference_memory_mb': peak_inference_memory_mb,
         'best_val_loss': best_val,
         'ablation': args.ablation,
         'k': args.k,
