@@ -175,8 +175,12 @@ def main():
                                            fold=fold, k=args.k, patch_size=args.patch_size)
             train_idx, val_idx, val_name = split_train_val(ds_train)
 
-            # Bản train có augment; bản val không augment (train=False)
-            ds_noaug = HestBaselineDataset(args.hest_dir, gene_list, train=False,
+            # Bản train có augment; bản val không augment. QUAN TRỌNG: ds_noaug vẫn phải
+            # là dataset GỘP nhiều mẫu (train=True, trừ test) — chỉ tắt augment —
+            # vì global index của val_sec/train_sec được tính theo cumlen của tập
+            # train (nhiều mẫu). Dùng train=False (chỉ chứa 1 mẫu test) sẽ làm
+            # cumlen size 1 → index toàn cục vượt → IndexError.
+            ds_noaug = HestBaselineDataset(args.hest_dir, gene_list, train=True,
                                            fold=fold, k=args.k, patch_size=args.patch_size)
             ds_noaug.ds.train = False   # tắt augment cho val
 
@@ -258,8 +262,9 @@ def main():
                 from models.STNet_model import STModel
                 m = STModel.load_from_checkpoint(best_ckpt, n_genes=n_genes,
                                                  learning_rate=args.lr, max_epochs=max_ep)
+                # TEST cần 4 phần tử (patch, loc, exp, center) cho stnet_predict —
+                # KHÔNG dùng _collate_drop_center (nó cắt về 3).
                 test_loader = DataLoader(ds_test, batch_size=bs, shuffle=False,
-                                         collate_fn=_collate_drop_center,
                                          num_workers=args.num_workers)
                 adata_pred, adata_gt = stnet_predict(m, test_loader, device=device)
 
