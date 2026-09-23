@@ -27,7 +27,7 @@ from models.LightHGGEP import LightHGGEP
 from predict import lighthggep_predict, get_section_ids, get_R, get_Spearman, get_MSE, get_MAE
 from sampler_utils import SectionBatchSampler, section_collate_fn
 
-from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, Callback
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import CSVLogger
 
@@ -38,6 +38,34 @@ ABLATION_FLAGS = {
     'no_cross_scale': dict(use_graph=True,  use_cross_scale=False, depthwise=True),
     'no_depthwise':   dict(use_graph=True,  use_cross_scale=True,  depthwise=False),
 }
+
+
+class HestEpochCallback(Callback):
+    """In 1 dòng tiến độ mỗi epoch (train/val mse+pcc, lr, thời gian, eta).
+    Hỗ trợ cả cặp key Light-HGGEP (val_*) lẫn STNet/HisToGene (valid_*)."""
+    def on_train_epoch_start(self, trainer, pl_module):
+        self.epoch_started_at = time.perf_counter()
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if trainer.sanity_checking or not trainer.is_global_zero:
+            return
+        m  = trainer.callback_metrics
+        train_mse = m.get('train_mse', m.get('train_loss', 0.0))
+        train_pcc = m.get('train_pcc', float('nan'))
+        val_mse   = m.get('val_mse',   m.get('valid_loss', m.get('val_loss', 0.0)))
+        val_pcc   = m.get('val_pcc',   m.get('valid_pcc', float('nan')))
+        ep    = trainer.current_epoch + 1
+        total = trainer.max_epochs
+        opt   = pl_module.optimizers()
+        if isinstance(opt, list):
+            opt = opt[0]
+        lr = opt.param_groups[0]['lr']
+        elapsed  = time.perf_counter() - getattr(self, 'epoch_started_at', time.perf_counter())
+        remaining = max(total - ep, 0) * elapsed
+        print(f"[ep {ep}/{total}] "
+              f"train_mse={float(train_mse):.4f} train_pcc={float(train_pcc):.4f} "
+              f"val_mse={float(val_mse):.4f} val_pcc={float(val_pcc):.4f} lr={lr:.4e} "
+              f"epoch_time={elapsed:.1f}s eta={remaining / 60:.1f}m", flush=True)
 
 
 def set_seed(seed=42):
@@ -97,7 +125,7 @@ def run_fold(fold, args, gene_list):
     trainer = pl.Trainer(
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
         devices=1, max_epochs=args.max_epochs,
-        callbacks=[early_stop, ckpt_cb], logger=logger,
+        callbacks=[early_stop, ckpt_cb, HestEpochCallback()], logger=logger,
         gradient_clip_val=1.0,
         precision='16-mixed' if torch.cuda.is_available() else '32-true',
         enable_progress_bar=False, enable_model_summary=False,

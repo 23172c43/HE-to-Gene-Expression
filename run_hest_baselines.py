@@ -34,6 +34,8 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import CSVLogger
 
+from run_hest_train import HestEpochCallback
+
 _HISTO_PATCH = 112   # HisToGene dùng patch 112 (template HER2ST)
 
 
@@ -220,7 +222,7 @@ def main():
             trainer = pl.Trainer(
                 accelerator='gpu' if torch.cuda.is_available() else 'cpu',
                 devices=1, max_epochs=max_ep,
-                callbacks=[early_stop, ckpt_cb], logger=logger,
+                callbacks=[early_stop, ckpt_cb, HestEpochCallback()], logger=logger,
                 gradient_clip_val=1.0,
                 precision='16-mixed' if torch.cuda.is_available() else '32-true',
                 enable_progress_bar=False, enable_model_summary=False,
