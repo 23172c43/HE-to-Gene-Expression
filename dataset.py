@@ -553,6 +553,30 @@ class LightHGGEP_HER2ST_Top250(LightHGGEP_HER2ST):
         top = sorted(gene_means.items(), key=lambda kv: kv[1], reverse=True)[:250]
         return [g for g, _ in top]
 
+def _read_hest_gene_matrix(h5ad_path):
+    """Doc rieng var_names + ma tran X tho (sparse/dense) tu 1 file .h5ad HEST,
+    dung CHI de tinh gene panel (khong can coords/anh). Tach rieng khoi
+    LightHGGEP_HEST_h5py._load_sample vi ham do can target_genes lam dau vao,
+    trong khi o day dang can doc X de QUYET DINH target_genes (ga va trung)."""
+    with h5py.File(h5ad_path, 'r') as f:
+        var_group = f['var']
+        index_col = var_group.attrs.get('_index', '_index')
+        raw_genes = var_group[index_col][:]
+        var_names = np.array([g.decode('utf-8') if isinstance(g, bytes) else g
+                              for g in raw_genes])
+        X_node = f['X']
+        shape = tuple(X_node.attrs.get('shape')) if 'shape' in X_node.attrs else None
+        if isinstance(X_node, h5py.Group) and 'data' in X_node:
+            data = X_node['data'][:]
+            indices = X_node['indices'][:]
+            indptr = X_node['indptr'][:]
+            X_matrix = sp.csr_matrix((data, indices, indptr), shape=shape)
+        else:
+            X_matrix = X_node[:]
+            if sp.issparse(X_matrix):
+                X_matrix = X_matrix.tocsr()
+    return var_names, X_matrix
+
 
 class LightHGGEP_HEST_h5py(torch.utils.data.Dataset):
     """Dataset HEST (.h5ad) cho Light-HGGEP, dạng GỘP nhiều mẫu theo kiểu
@@ -765,3 +789,48 @@ class LightHGGEP_HEST_h5py(torch.utils.data.Dataset):
             return pat, loc_t, exp_t, name, idx
         else:
             return pat, loc_t, exp_t, center_t, name, idx
+
+class LightHGGEP_HEST_h5py_Top785(LightHGGEP_HEST_h5py):
+    """LightHGGEP_HEST_h5py voi gene panel 785 gene tinh RIENG tu chinh du lieu
+    HEST (khong dung her_hvg_cut_1000.npy chon tu HER2ST nua). Chi tinh tren cac
+    mau train+val cua DUNG fold hien tai (loai mau test), tong bieu hien cao nhat
+    trong so gene chung cho toan bo mau panel -- dung tinh than chong ro ri du lieu
+    cua script tien xu ly da dan (allowed_panel_patients = train + val, khong dung
+    test).
+    """
+    N_TOP_GENES = 785
+
+    def __init__(self, h5_dir, gene_list=None, train=True, fold=0, k_neighbors=4,
+                 patch_size=224):
+        # gene_list truyen vao (neu co) se BI BO QUA -- tu tinh lai tu HEST. Giu
+        # tham so nay de khop chu ky goi __init__ voi class cha, khong phai sua
+        # noi goi ben ngoai (run_hest_train.py) theo chu ky khac.
+        computed_gene_list = self._select_gene_list(h5_dir, fold)
+        super().__init__(h5_dir, computed_gene_list, train=train, fold=fold,
+                         k_neighbors=k_neighbors, patch_size=patch_size)
+
+    def _select_gene_list(self, h5_dir, fold):
+        paths = sorted(glob.glob(os.path.join(h5_dir, '*.h5ad')))
+        all_samples = sorted(os.path.basename(p).split('.')[0] for p in paths)
+        test_sample = all_samples[fold % len(all_samples)]
+        panel_names = [s for s in all_samples if s != test_sample]   # train+val = tru test
+
+        # 1) Gene chung cho toan bo mau panel (giong common_genes trong script goc)
+        common_genes = None
+        for name in panel_names:
+            var_names, _ = _read_hest_gene_matrix(os.path.join(h5_dir, name + '.h5ad'))
+            genes = set(var_names)
+            common_genes = genes if common_genes is None else (common_genes & genes)
+        common_genes = sorted(common_genes)   # thu tu co dinh de doi chieu index nhat quan
+
+        # 2) Tong bieu hien tung gene tren toan bo mau panel -> lay 785 cao nhat
+        gene_sum = None
+        for name in panel_names:
+            var_names, X_matrix = _read_hest_gene_matrix(os.path.join(h5_dir, name + '.h5ad'))
+            gene2col = {g: i for i, g in enumerate(var_names)}
+            cols = [gene2col[g] for g in common_genes]
+            partial_sum = np.asarray(X_matrix[:, cols].sum(axis=0)).flatten()
+            gene_sum = partial_sum if gene_sum is None else gene_sum + partial_sum
+
+        order = np.argsort(gene_sum)[::-1][:self.N_TOP_GENES]
+        return [common_genes[i] for i in order]

@@ -15,14 +15,14 @@ import os
 import random
 import time
 import warnings
-
+import json
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
 warnings.filterwarnings('ignore')
 
-from dataset import LightHGGEP_HEST_h5py
+from dataset import LightHGGEP_HEST_h5py, LightHGGEP_HEST_h5py_Top785
 from models.LightHGGEP import LightHGGEP
 from predict import (lighthggep_predict, get_section_ids, get_R, get_Spearman,
                      get_MSE, get_MAE, get_MoransI_all)
@@ -80,12 +80,21 @@ def set_seed(seed=42):
 
 
 def run_fold(fold, args, gene_list):
-    N_GENES = len(gene_list)
     abl = ABLATION_FLAGS[args.ablation]
+    DATASET_CLASS = (LightHGGEP_HEST_h5py_Top785 if args.gene_panel == 'hest_top785'
+                      else LightHGGEP_HEST_h5py)
 
-    train_dataset = LightHGGEP_HEST_h5py(
+    train_dataset = DATASET_CLASS(
         args.hest_dir, gene_list, train=True, fold=fold,
         k_neighbors=args.k, patch_size=args.patch_size)
+    N_GENES = len(train_dataset.target_genes)   # doc tu dataset, dung cho ca 2 che do
+        # [MỚI] Lưu gene_list THẬT SỰ đã dùng cho fold này (quan trọng với gene-panel=hest_top785,
+    # vì panel có thể khác nhau giữa các fold). Dùng để đối chiếu chéo với baselines trước khi gộp bảng.
+    gene_dump_dir = os.path.join(args.ckpt_dir, "gene_lists")
+    os.makedirs(gene_dump_dir, exist_ok=True)
+    gene_dump_path = os.path.join(gene_dump_dir, f"lighthggep_fold{fold}_{args.gene_panel}.json")
+    with open(gene_dump_path, "w") as _f:
+        json.dump(list(train_dataset.target_genes), _f)
     VAL_SECTION = sorted(train_dataset.names)[0]   # mẫu train alphabet đầu làm val
 
     # test mẫu cho fold này = mẫu fold (tên file)
@@ -144,7 +153,7 @@ def run_fold(fold, args, gene_list):
 
     # ---- Test ----
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    test_dataset = LightHGGEP_HEST_h5py(
+    test_dataset = DATASET_CLASS(
         args.hest_dir, gene_list, train=False, fold=fold,
         k_neighbors=args.k, patch_size=args.patch_size)
     for section, A_norm in test_dataset.A_norm_cache.items():
@@ -214,6 +223,10 @@ def main():
     _p.add_argument('--hest-dir', type=str, default='data/hest/st')
     _p.add_argument('--gene-list', type=str, default='data/her_hvg_cut_1000.npy')
     _p.add_argument('--k', type=int, default=4)
+    _p.add_argument('--gene-panel', choices=['fixed', 'hest_top785'], default='fixed',
+                    help="'fixed': dung --gene-list co san (785 gene chon tu HER2ST). "
+                         "'hest_top785': tu tinh 785 gene bieu hien cao nhat rieng tu "
+                         "HEST, chi tren mau train+val cua tung fold, chong ro ri.")
     _p.add_argument('--ablation', choices=list(ABLATION_FLAGS), default='full')
     _p.add_argument('--patch-size', type=int, default=224)
     _p.add_argument('--num-workers', type=int, default=2)
@@ -231,8 +244,12 @@ def main():
     set_seed(args.seed)
     os.makedirs(args.ckpt_dir, exist_ok=True)
 
-    gene_list = list(np.load(args.gene_list, allow_pickle=True))
-    print(f"Gene list: {args.gene_list} -> {len(gene_list)} gene")
+    if args.gene_panel == 'fixed':
+        gene_list = list(np.load(args.gene_list, allow_pickle=True))
+        print(f"Gene list: {args.gene_list} -> {len(gene_list)} gene")
+    else:
+        gene_list = None   # LightHGGEP_HEST_h5py_Top785 tu tinh rieng tung fold
+        print("Gene panel: tu tinh 785 gene rieng tu HEST (per-fold, chong ro ri)")
 
     all_samples = sorted(os.path.basename(p).split('.')[0]
                          for p in os.listdir(args.hest_dir) if p.endswith('.h5ad'))
@@ -254,7 +271,7 @@ def main():
         rows.append(run_fold(fold, args, gene_list))
 
     df = pd.DataFrame(rows)
-    out = f"hest_train_{args.ablation}_k{args.k}.csv"
+    out = f"hest_train_{args.ablation}_k{args.k}_{args.gene_panel}.csv"
     if os.path.isfile(out):
         old = pd.read_csv(out)
         old = old[~old['fold'].isin(df['fold'])]

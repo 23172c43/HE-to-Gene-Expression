@@ -26,7 +26,7 @@ from torch.utils.data.dataloader import default_collate
 
 warnings.filterwarnings('ignore')
 
-from dataset import LightHGGEP_HEST_h5py
+from dataset import LightHGGEP_HEST_h5py, LightHGGEP_HEST_h5py_Top785
 from predict import stnet_predict, histogene_predict, get_section_ids
 from predict import get_R, get_Spearman, get_MSE, get_MAE, get_MoransI_all
 
@@ -40,13 +40,14 @@ _HISTO_PATCH = 112   # HisToGene dùng patch 112 (template HER2ST)
 
 
 class HestBaselineDataset(Dataset):
-    """Adapter: bọc LightHGGEP_HEST_h5py để __getitem__ trả 4 phần tử
+    """Adapter: bọc LightHGGEP_HEST_h5py (hoặc _Top785) để __getitem__ trả 4 phần tử
     (patch, loc, exp, center) — khớp kỳ vọng của stnet_predict / histogene_predict
     (HER2ST train=False trả 4 phần tử). HEST dataset test trả 6, cần drop name, idx.
     """
-    def __init__(self, h5_dir, gene_list, train, fold, k, patch_size):
-        self.ds = LightHGGEP_HEST_h5py(h5_dir, gene_list, train=train, fold=fold,
-                                       k_neighbors=k, patch_size=patch_size)
+    def __init__(self, h5_dir, gene_list, train, fold, k, patch_size, dataset_class=None):
+        dataset_class = dataset_class or LightHGGEP_HEST_h5py
+        self.ds = dataset_class(h5_dir, gene_list, train=train, fold=fold,
+                                k_neighbors=k, patch_size=patch_size)
         self.train = train
 
     def __len__(self):
@@ -120,6 +121,9 @@ def main():
     _p.add_argument('--gene-list', type=str, default='data/her_hvg_cut_1000.npy')
     _p.add_argument('--k', type=int, default=4,
                     help="Chỉ dùng để build graph dataset (baseline ko dùng graph, giữ tham số cho nhất quán)")
+    _p.add_argument('--gene-panel', choices=['fixed', 'hest_top785'], default='fixed',
+                    help="Phải khớp với --gene-panel đã dùng khi chạy run_hest_train.py "
+                         "cho Micro-GEP, để 3 mô hình so sánh trên cùng bộ gene mỗi fold.")
     _p.add_argument('--patch-size', type=int, default=224)
     _p.add_argument('--num-workers', type=int, default=0)
     _p.add_argument('--batch-size', type=int, default=None,
@@ -138,9 +142,14 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    gene_list = list(np.load(args.gene_list, allow_pickle=True))
-    n_genes = len(gene_list)
-    print(f"Gene list: {args.gene_list} -> {n_genes} gene")
+    DATASET_CLASS = (LightHGGEP_HEST_h5py_Top785 if args.gene_panel == 'hest_top785'
+                      else LightHGGEP_HEST_h5py)
+    if args.gene_panel == 'fixed':
+        gene_list = list(np.load(args.gene_list, allow_pickle=True))
+        print(f"Gene list: {args.gene_list} -> {len(gene_list)} gene")
+    else:
+        gene_list = None
+        print("Gene panel: tu tinh 785 gene rieng tu HEST (per-fold, chong ro ri)")
 
     all_samples = sorted(os.path.basename(p).split('.')[0]
                          for p in os.listdir(args.hest_dir) if p.endswith('.h5ad'))
@@ -171,8 +180,11 @@ def main():
             print(f"\n{'='*66}\nMODE {mode.upper()} | FOLD {fold} | TEST={test_sample}\n{'='*66}")
 
             # ---- TRAIN (LOPO) ----
+                        # ---- TRAIN (LOPO) ----
             ds_train = HestBaselineDataset(args.hest_dir, gene_list, train=True,
-                                           fold=fold, k=args.k, patch_size=args.patch_size)
+                                           fold=fold, k=args.k, patch_size=args.patch_size,
+                                           dataset_class=DATASET_CLASS)
+            n_genes = len(ds_train.ds.target_genes)   # [MỚI] doc tu dataset, dung cho fold nay
             train_idx, val_idx, val_name = split_train_val(ds_train)
 
             # Bản train có augment; bản val không augment. QUAN TRỌNG: ds_noaug vẫn phải
@@ -181,8 +193,9 @@ def main():
             # train (nhiều mẫu). Dùng train=False (chỉ chứa 1 mẫu test) sẽ làm
             # cumlen size 1 → index toàn cục vượt → IndexError.
             ds_noaug = HestBaselineDataset(args.hest_dir, gene_list, train=True,
-                                           fold=fold, k=args.k, patch_size=args.patch_size)
-            ds_noaug.ds.train = False   # tắt augment cho val
+                                           fold=fold, k=args.k, patch_size=args.patch_size,
+                                           dataset_class=DATASET_CLASS)
+            ds_noaug.ds.train = False
 
             if mode == 'histogene':
                 # slide-level
@@ -247,7 +260,8 @@ def main():
 
             # ---- TEST ----
             ds_test = HestBaselineDataset(args.hest_dir, gene_list, train=False,
-                                          fold=fold, k=args.k, patch_size=args.patch_size)
+                                          fold=fold, k=args.k, patch_size=args.patch_size,
+                                          dataset_class=DATASET_CLASS)
             ds_test_raw = ds_test.ds
 
             # Đo thời gian + peak memory cho inference (giống run_pipeline)
@@ -323,7 +337,7 @@ def main():
                 torch.cuda.empty_cache()
 
     df = pd.DataFrame(rows)
-    out = "hest_baselines.csv"
+    out = f"hest_baselines_{args.gene_panel}.csv"
     if os.path.isfile(out):
         old = pd.read_csv(out)
         idx = old.set_index(['mode', 'fold']).index
