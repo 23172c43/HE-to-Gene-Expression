@@ -295,10 +295,16 @@ def main():
                                          if torch.cuda.is_available() else float('nan'))
 
             # ---- METRIC ----
+                        # ---- METRIC ----
             mask = np.abs(adata_gt.X).max(axis=0) > 0
             mask = np.array(mask).flatten()
             n_genes_eval = int(mask.sum())
-            subset = [g for g, keep in zip(gene_list, mask) if keep]
+
+            # Gene list THỰC TẾ của fold này — hoạt động cho cả 'fixed' và 'hest_top785'
+            # (khi gene_panel='hest_top785', biến global `gene_list` = None).
+            fold_genes = list(ds_test_raw.target_genes)
+            subset = [g for g, keep in zip(fold_genes, mask) if keep]
+
             ap = adata_pred[:, mask].copy()
             ag = adata_gt[:, mask].copy()
 
