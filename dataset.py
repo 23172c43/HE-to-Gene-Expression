@@ -792,11 +792,10 @@ class LightHGGEP_HEST_h5py(torch.utils.data.Dataset):
 
 class LightHGGEP_HEST_h5py_Top785(LightHGGEP_HEST_h5py):
     """LightHGGEP_HEST_h5py voi gene panel 785 gene tinh RIENG tu chinh du lieu
-    HEST (khong dung her_hvg_cut_1000.npy chon tu HER2ST nua). Chi tinh tren cac
-    mau train+val cua DUNG fold hien tai (loai mau test), tong bieu hien cao nhat
-    trong so gene chung cho toan bo mau panel -- dung tinh than chong ro ri du lieu
-    cua script tien xu ly da dan (allowed_panel_patients = train + val, khong dung
-    test).
+    HEST (khong dung her_hvg_cut_1000.npy chon tu HER2ST nua). Tinh tren TOAN BO
+    mau (ca train, val, test), TRUOC LOPO split -- dung 1 bo gene co dinh cho moi
+    fold, khong lech gene panel giua cac fold. Dung chung cho ca 3 model qua
+    HestBaselineDataset (run_hest_baselines.py).
     """
     N_TOP_GENES = 785
 
@@ -812,9 +811,8 @@ class LightHGGEP_HEST_h5py_Top785(LightHGGEP_HEST_h5py):
     def _select_gene_list(self, h5_dir, fold):
         paths = sorted(glob.glob(os.path.join(h5_dir, '*.h5ad')))
         all_samples = sorted(os.path.basename(p).split('.')[0] for p in paths)
-        test_sample = all_samples[fold % len(all_samples)]
-        panel_names = [s for s in all_samples if s != test_sample]   # train+val = tru test
-
+        panel_names = all_samples   # chon tren TOAN BO mau (gom ca test), truoc LOPO split
+        
         # 1) Gene chung cho toan bo mau panel (giong common_genes trong script goc)
         common_genes = None
         for name in panel_names:
