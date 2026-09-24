@@ -670,9 +670,11 @@ class LightHGGEP_HEST_h5py(torch.utils.data.Dataset):
             N = X_matrix.shape[0]
 
             # exp: giữ đủ gene_list, gene thiếu -> cột 0
+            # [ĐỒNG BỘ THANG VỚI HER2ST] HER2ST dùng log1p(raw_count) (xem dòng 101) —
+            # nên HEST cũng dùng log1p(raw_count) để RMSE/MAE so sánh chéo dataset được.
+            # (Trước đây dùng log1p(CPM) = log1p((count/library_size)*1e6) — thang ~8-13,
+            # khiến Light-HGGEP RMSE to ~80 và không khớp HER2ST.)
             gene2col = {g: i for i, g in enumerate(var_names)}
-            spot_sums = np.asarray(X_matrix.sum(axis=1)).flatten()
-            spot_sums[spot_sums == 0] = 1.0
             exp = np.zeros((N, len(self.target_genes)), dtype=np.float32)
             common = 0
             for j, g in enumerate(self.target_genes):
@@ -680,7 +682,7 @@ class LightHGGEP_HEST_h5py(torch.utils.data.Dataset):
                 if col is None:
                     continue
                 col_vec = X_matrix[:, col].toarray().flatten()
-                exp[:, j] = np.log1p((col_vec / spot_sums) * 1e6)
+                exp[:, j] = np.log1p(col_vec)   # khớp HER2ST: log1p(raw_count)
                 common += 1
             print(f"[HEST] {name}: {common}/{len(self.target_genes)} gene có mặt; N={N}")
 
