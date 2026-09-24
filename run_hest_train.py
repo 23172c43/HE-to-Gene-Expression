@@ -79,7 +79,7 @@ def set_seed(seed=42):
     torch.backends.cudnn.benchmark = False
 
 
-def run_fold(fold, args, gene_list):
+def run_fold(fold, args, gene_list, cnn_chunk):
     abl = ABLATION_FLAGS[args.ablation]
     DATASET_CLASS = (LightHGGEP_HEST_h5py_Top785 if args.gene_panel == 'hest_top785'
                       else LightHGGEP_HEST_h5py)
@@ -119,7 +119,7 @@ def run_fold(fold, args, gene_list):
     model = LightHGGEP(
         n_genes=N_GENES, k_neighbors=args.k,
         learning_rate=args.lr, max_epochs=args.max_epochs,
-        cnn_chunk=args.batch_size, **abl)
+        cnn_chunk=cnn_chunk, **abl)
     for section, A_norm in train_dataset.A_norm_cache.items():
         model.set_graph(section, torch.from_numpy(A_norm).float())
 
@@ -149,7 +149,7 @@ def run_fold(fold, args, gene_list):
     best_model = LightHGGEP.load_from_checkpoint(
         best_ckpt, n_genes=N_GENES, k_neighbors=args.k,
         learning_rate=args.lr, max_epochs=args.max_epochs,
-        cnn_chunk=args.batch_size, **abl)
+        cnn_chunk=cnn_chunk, **abl)
 
     # ---- Test ----
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -218,6 +218,7 @@ def run_fold(fold, args, gene_list):
         'best_val_loss': best_val,
         'ablation': args.ablation,
         'k': args.k,
+        'cnn_chunk': cnn_chunk,
         'n_genes': N_GENES,
     }
 
@@ -229,12 +230,17 @@ def main():
     _p.add_argument('--k', type=int, default=4)
     _p.add_argument('--gene-panel', choices=['fixed', 'hest_top785'], default='fixed',
                     help="'fixed': dung --gene-list co san (785 gene chon tu HER2ST). "
-                         "'hest_top785': tu tinh 785 gene bieu hien cao nhat rieng tu "
-                         "HEST, chi tren mau train+val cua tung fold, chong ro ri.")
+                         "'hest_top785': tu tinh 785 gene bieu hien cao nhat tu "
+                         "TOAN BO mau HEST (truoc LOPO split), 1 bo gene co dinh "
+                         "dung cho moi fold.")
     _p.add_argument('--ablation', choices=list(ABLATION_FLAGS), default='full')
     _p.add_argument('--patch-size', type=int, default=224)
     _p.add_argument('--num-workers', type=int, default=2)
     _p.add_argument('--batch-size', type=int, default=32)
+    _p.add_argument('--cnn-chunk', type=int, default=None,
+                    help="Số patch xử lý đồng thời qua CNN trong forward. "
+                         "Mặc định = --batch-size nếu không truyền (chỉ Light-HGGEP dùng, "
+                         "tương tự --cnn-chunk của run_pipeline.py).")
     _p.add_argument('--lr', type=float, default=1e-4)
     _p.add_argument('--max-epochs', type=int, default=100)
     _p.add_argument('--patience', type=int, default=15)
@@ -247,6 +253,9 @@ def main():
 
     set_seed(args.seed)
     os.makedirs(args.ckpt_dir, exist_ok=True)
+    # cnn_chunk mặc định = batch_size (giống run_pipeline: CNN_CHUNK = _args.cnn_chunk or BATCH_SIZE)
+    CNN_CHUNK = args.cnn_chunk if args.cnn_chunk is not None else args.batch_size
+    print(f"cnn_chunk = {CNN_CHUNK} (batch_size = {args.batch_size})")
 
     if args.gene_panel == 'fixed':
         gene_list = list(np.load(args.gene_list, allow_pickle=True))
@@ -272,7 +281,7 @@ def main():
     import pandas as pd
     rows = []
     for fold in range(args.fold_start, n_fold):
-        rows.append(run_fold(fold, args, gene_list))
+        rows.append(run_fold(fold, args, gene_list, CNN_CHUNK))
 
     df = pd.DataFrame(rows)
     out = f"hest_train_{args.ablation}_k{args.k}_{args.gene_panel}.csv"
