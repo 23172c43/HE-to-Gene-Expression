@@ -180,7 +180,11 @@ def run_fold(fold, args, gene_list):
     # Loại cột toàn-0 (gene vắng / không phát hiện) khỏi metric
     mask = np.array((np.abs(adata_gt.X).max(axis=0) > 0)).flatten()
     n_genes_eval = int(mask.sum())
-    subset = [g for g, keep in zip(gene_list, mask) if keep]
+    # [SỬA] gene_list co the la None khi --gene-panel=hest_top785 (panel tu tinh
+    # rieng tung fold). Dung test_dataset.target_genes -- luon dung cho ca 2 che do,
+    # dung y het cach run_hest_baselines.py da sua (fold_genes = ds_test_raw.target_genes).
+    fold_genes = list(test_dataset.target_genes)
+    subset = [g for g, keep in zip(fold_genes, mask) if keep]
     ap = adata_pred[:, mask].copy()
     ag = adata_gt[:, mask].copy()
 
