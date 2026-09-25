@@ -184,8 +184,14 @@ _p.add_argument('--ablation', choices=['full', 'no_graph', 'no_cross_scale', 'no
 _p.add_argument('--k', type=int, default=4,
                 help="So lang gieng gan nhat (k) cho do thi K-NN trong Spatial SGC. "
                      "Mac dinh 4. Loi khuyen: chay k trong {2,4,8,12,16} de khao sat.")
+_p.add_argument('--batch-sampler', choices=['random', 'spatial_cluster'], default='random',
+                help="'random' (mac dinh, hanh vi cu). 'spatial_cluster': gom moi batch "
+                     "thanh 1 cum khong gian lien ke (K-means) -- sua loi lech pha "
+                     "train/test cua Spatial SGC, cung nguyen nhan da sua ben HEST, muc "
+                     "do nhe hon vi section HER2ST it spot hon.")
 _args = _p.parse_args()
 DATASET = _args.datasets
+BATCH_SAMPLER = _args.batch_sampler
 SKIP_TRAIN = _args.skip_train
 ABLATION = _args.ablation
 # Map ablation name -> 3 co cua model
@@ -220,6 +226,7 @@ print(f"  PATIENCE = {PATIENCE}")
 print(f"  LEARNING_RATE = {LEARNING_RATE}")
 print(f"  BATCH_SIZE = {BATCH_SIZE}")
 print(f"  NUM_WORKERS = {NUM_WORKERS} per DDP rank")
+print(f"  BATCH_SAMPLER = {BATCH_SAMPLER}")
 
 # ============================================================================
 # ---- Cell 22 (notebook gốc) ----
@@ -243,7 +250,7 @@ print(f"  NUM_WORKERS = {NUM_WORKERS} per DDP rank")
 # forward()/training_step()/validation_step()/test_step()), day la cach va dung o dung lop
 # DataLoader, khong dung vao logic model/dataset.
 
-from sampler_utils import SectionBatchSampler, section_collate_fn
+from sampler_utils import SectionBatchSampler, SpatialClusterBatchSampler, section_collate_fn
 
 from pytorch_lightning.callbacks import Callback
 
@@ -330,12 +337,23 @@ def run_fold(fold):
     # exports WORLD_SIZE.  Fall back to the configured device count so rank 0 also
     # receives only its own section shard rather than processing the full dataset.
     DDP_WORLD_SIZE = int(os.environ.get("WORLD_SIZE", N_GPUS))
-    train_sampler = SectionBatchSampler(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
-                                         exclude_sections=[VAL_SECTION], rank=DDP_RANK,
-                                         num_replicas=DDP_WORLD_SIZE, shard_sections=True)
-    val_sampler = SectionBatchSampler(train_dataset, batch_size=BATCH_SIZE, shuffle=False,
-                                       include_sections=[VAL_SECTION], rank=DDP_RANK,
-                                       num_replicas=DDP_WORLD_SIZE, shard_sections=False)
+    if BATCH_SAMPLER == 'spatial_cluster':
+        # SpatialClusterBatchSampler chua ho tro rank/num_replicas/shard_sections (xem
+        # sampler_utils.py) -- chi an toan vi N_GPUS = 1 co dinh cho HER2ST (Cell 3:
+        # "N_GPUS = 1  # LightHGGEP is I/O-bound..."). Neu sau nay tang N_GPUS > 1 cho
+        # HER2ST, PHAI bo sung sharding cho class nay truoc, khong duoc dung truc tiep.
+        assert N_GPUS == 1, "SpatialClusterBatchSampler chua ho tro multi-GPU sharding."
+        train_sampler = SpatialClusterBatchSampler(train_dataset, batch_size=BATCH_SIZE,
+                                                   shuffle=True, exclude_sections=[VAL_SECTION])
+        val_sampler = SpatialClusterBatchSampler(train_dataset, batch_size=BATCH_SIZE,
+                                                 shuffle=False, include_sections=[VAL_SECTION])
+    else:
+        train_sampler = SectionBatchSampler(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+                                            exclude_sections=[VAL_SECTION], rank=DDP_RANK,
+                                            num_replicas=DDP_WORLD_SIZE, shard_sections=True)
+        val_sampler = SectionBatchSampler(train_dataset, batch_size=BATCH_SIZE, shuffle=False,
+                                          include_sections=[VAL_SECTION], rank=DDP_RANK,
+                                          num_replicas=DDP_WORLD_SIZE, shard_sections=False)
     print(f"DDP data shard: rank {DDP_RANK}/{DDP_WORLD_SIZE}; "
           f"train sections={len(train_sampler.section_names)}, "
           f"train batches={len(train_sampler)}", flush=True)
@@ -650,6 +668,7 @@ def run_fold(fold):
         'inference_time_per_spot_ms': inference_time_per_spot_ms,
         'peak_inference_memory_mb':   peak_inference_memory_mb,
         'cnn_chunk':      CNN_CHUNK,
+        'batch_sampler':  BATCH_SAMPLER,
         'n_test_spots':   n_spots,
         'best_val_loss':  float(checkpoint_callback.best_model_score),
         'eval_protocol':  PROTOCOL_NAME,
@@ -704,7 +723,7 @@ results = pd.DataFrame(all_rows)
 # theo cột 'fold'), để chạy lẻ từng fold (vd --fold-start 5 --fold-end 6) không mất
 # kết quả các fold đã chạy trước đó. Khớp logic append của run_baselines.py.
 summary_csv = (f"Light-HGGEP_memoryprofile_chunk{CNN_CHUNK}.csv" if SKIP_TRAIN
-               else "Light-HGGEP_results.csv")
+            else f"Light-HGGEP_results_{BATCH_SAMPLER}.csv")
 if os.path.isfile(summary_csv):
     old = pd.read_csv(summary_csv)
     old = old[~old["fold"].isin(results["fold"])]
