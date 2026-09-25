@@ -26,7 +26,7 @@ from dataset import LightHGGEP_HEST_h5py, LightHGGEP_HEST_h5py_Top785
 from models.LightHGGEP import LightHGGEP
 from predict import (lighthggep_predict, get_section_ids, get_R, get_Spearman,
                      get_MSE, get_MAE, get_MoransI_all)
-from sampler_utils import SectionBatchSampler, section_collate_fn
+from sampler_utils import SectionBatchSampler, SpatialClusterBatchSampler, section_collate_fn
 
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, Callback
 import pytorch_lightning as pl
@@ -104,10 +104,12 @@ def run_fold(fold, args, gene_list, cnn_chunk):
     print(f"\n{'='*72}\nFOLD {fold} | TEST={TEST_SECTION} | VAL={VAL_SECTION} | "
           f"train={len(train_dataset.names)}\n{'='*72}")
 
-    train_sampler = SectionBatchSampler(train_dataset, batch_size=args.batch_size,
-                                        shuffle=True, exclude_sections=[VAL_SECTION])
-    val_sampler = SectionBatchSampler(train_dataset, batch_size=args.batch_size,
-                                      shuffle=False, include_sections=[VAL_SECTION])
+    SamplerCls = (SpatialClusterBatchSampler if args.batch_sampler == 'spatial_cluster'
+                  else SectionBatchSampler)
+    train_sampler = SamplerCls(train_dataset, batch_size=args.batch_size,
+                               shuffle=True, exclude_sections=[VAL_SECTION])
+    val_sampler = SamplerCls(train_dataset, batch_size=args.batch_size,
+                             shuffle=False, include_sections=[VAL_SECTION])
     train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
                               collate_fn=section_collate_fn, num_workers=args.num_workers,
                               pin_memory=torch.cuda.is_available())
@@ -219,6 +221,7 @@ def run_fold(fold, args, gene_list, cnn_chunk):
         'ablation': args.ablation,
         'k': args.k,
         'cnn_chunk': cnn_chunk,
+        'batch_sampler': args.batch_sampler,
         'n_genes': N_GENES,
     }
 
@@ -233,6 +236,14 @@ def main():
                          "'hest_top785': tu tinh 785 gene bieu hien cao nhat tu "
                          "TOAN BO mau HEST (truoc LOPO split), 1 bo gene co dinh "
                          "dung cho moi fold.")
+    _p.add_argument('--batch-sampler', choices=['random', 'spatial_cluster'], default='random',
+                    help="'random' (mac dinh, hanh vi cu): cat batch bang xao toan bo "
+                         "section roi cat theo batch_size -- voi section nhieu spot "
+                         "(HEST) gan nhu khong giu duoc canh k-NN that nao trong batch, "
+                         "lam A_norm_batch suy bien luc train, lech pha voi luc test "
+                         "(full_section=True). 'spatial_cluster': gom moi batch thanh 1 "
+                         "cum khong gian lien ke (K-means toa do) -- sua loi tren. "
+                         "CHI anh huong pipeline HEST nay, KHONG dung cho HER2ST.")
     _p.add_argument('--ablation', choices=list(ABLATION_FLAGS), default='full')
     _p.add_argument('--patch-size', type=int, default=224)
     _p.add_argument('--num-workers', type=int, default=2)
@@ -284,7 +295,7 @@ def main():
         rows.append(run_fold(fold, args, gene_list, CNN_CHUNK))
 
     df = pd.DataFrame(rows)
-    out = f"hest_train_{args.ablation}_k{args.k}_{args.gene_panel}.csv"
+    out = f"hest_train_{args.ablation}_k{args.k}_{args.gene_panel}_{args.batch_sampler}.csv"
     if os.path.isfile(out):
         old = pd.read_csv(out)
         old = old[~old['fold'].isin(df['fold'])]

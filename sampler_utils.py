@@ -105,7 +105,81 @@ class SectionBatchSampler(Sampler):
     def __len__(self):
         return self.steps_per_epoch
 
+class SpatialClusterBatchSampler(Sampler):
+    """[MỚI - chỉ dùng cho HEST] Giống SectionBatchSampler nhưng gom mỗi batch thành
+    1 CỤM KHÔNG GIAN liền kề (K-means trên tọa độ) thay vì cắt ngẫu nhiên sau khi xáo
+    toàn bộ section. Sửa lỗi: với section nhiều spot (Visium/HEST, thường vài nghìn
+    spot/section), batch ngẫu nhiên gần như không chứa cạnh k-NN thật nào -> A_norm_batch
+    suy biến gần như chỉ còn self-loop lúc train, trong khi lúc test (full_section=True)
+    lại dùng đồ thị đầy đủ -- lệch pha train/test nghiêm trọng, gây RMSE/MAE rất cao dù
+    train loss vẫn giảm bình thường.
 
+    KHÔNG dùng cho HER2ST (dùng SectionBatchSampler như cũ, không đổi gì) -- lớp này
+    hoàn toàn độc lập.
+
+    Chỉ hỗ trợ đúng những gì run_hest_train.py cần: include/exclude_sections, shuffle
+    THỨ TỰ CỤM (không xáo bên trong cụm, vì xáo bên trong sẽ phá mất tính không gian
+    liền kề vừa gom được). Không hỗ trợ rank/num_replicas/full_section (HEST hiện
+    không chạy DDP nhiều GPU).
+    """
+    def __init__(self, dataset, batch_size, shuffle=True,
+                 include_sections=None, exclude_sections=None):
+        import numpy as np
+        from sklearn.cluster import KMeans
+
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+
+        section_indices = {}
+        start = 0
+        for i, length in enumerate(dataset.lengths):
+            name = dataset.id2name[i]
+            section_indices[name] = list(range(start, start + length))
+            start += length
+
+        if include_sections is not None:
+            section_indices = {k: v for k, v in section_indices.items()
+                               if k in set(include_sections)}
+        if exclude_sections is not None:
+            section_indices = {k: v for k, v in section_indices.items()
+                               if k not in set(exclude_sections)}
+
+        self.section_names = list(section_indices.keys())
+        self._spatial_batches = {}   # name -> list cac batch (moi batch = list global-idx)
+        for name, idx_range in section_indices.items():
+            length = len(idx_range)
+            if length > batch_size:
+                coords = np.asarray(dataset.loc_dict[name], dtype=np.float64)
+                n_clusters = max(1, round(length / batch_size))
+                labels = KMeans(n_clusters=n_clusters, n_init=3, random_state=42
+                                ).fit_predict(coords)
+                clusters = [[] for _ in range(n_clusters)]
+                for local_i, lab in enumerate(labels):
+                    clusters[lab].append(idx_range[local_i])
+                self._spatial_batches[name] = [c for c in clusters if len(c) > 0]
+            else:
+                self._spatial_batches[name] = [idx_range]
+
+        self.steps_per_epoch = sum(len(v) for v in self._spatial_batches.values())
+
+    def __iter__(self):
+        section_names = self.section_names.copy()
+        if self.shuffle:
+            random.shuffle(section_names)
+        emitted = 0
+        for name in section_names:
+            spatial_batches = list(self._spatial_batches[name])
+            if self.shuffle:
+                random.shuffle(spatial_batches)   # xao THU TU cum, giu nguyen NOI DUNG cum
+            for batch in spatial_batches:
+                if emitted >= self.steps_per_epoch:
+                    return
+                yield batch
+                emitted += 1
+
+    def __len__(self):
+        return self.steps_per_epoch
+    
 def section_collate_fn(batch):
     """Thay the default_collate CHI cho truong section_name (str -> giu nguyen 1 chuoi
     thay vi bi goi thanh list). Moi truong khac (patch_3ch/loc/exp/center/local_idx) duoc
