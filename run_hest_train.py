@@ -161,8 +161,16 @@ def run_fold(fold, args, gene_list, cnn_chunk):
     for section, A_norm in test_dataset.A_norm_cache.items():
         best_model.set_graph(section, torch.from_numpy(A_norm).float())
 
-    test_sampler = SectionBatchSampler(test_dataset, batch_size=args.batch_size,
-                                       shuffle=False, full_section=True)
+    # Chọn test sampler theo --test-batch-sampler:
+    #  'spatial_cluster' (mặc định): mỗi batch = cụm không gian liền kề → nhanh, ít VRAM,
+    #       gần bằng full_section (k-NN xuyên cụm gần như không có).
+    #  'full_section'     : cả section = 1 batch (chính xác tuyệt đối nhưng chậm/nặng).
+    if args.test_batch_sampler == 'spatial_cluster':
+        test_sampler = SpatialClusterBatchSampler(test_dataset, batch_size=args.batch_size,
+                                                  shuffle=False)
+    else:
+        test_sampler = SectionBatchSampler(test_dataset, batch_size=args.batch_size,
+                                           shuffle=False, full_section=True)
     test_loader = DataLoader(test_dataset, batch_sampler=test_sampler,
                              collate_fn=section_collate_fn, num_workers=args.num_workers,
                              pin_memory=torch.cuda.is_available())
@@ -244,6 +252,12 @@ def main():
                          "(full_section=True). 'spatial_cluster': gom moi batch thanh 1 "
                          "cum khong gian lien ke (K-means toa do) -- sua loi tren. "
                          "CHI anh huong pipeline HEST nay, KHONG dung cho HER2ST.")
+    _p.add_argument('--test-batch-sampler', choices=['spatial_cluster', 'full_section'],
+                    default='spatial_cluster',
+                    help="Cách gom batch khi TEST/predict: 'spatial_cluster' (mặc định, "
+                         "nhanh + ít VRAM): mỗi batch = cụm không gian liền kề → gần bằng "
+                         "full_section vì k-NN xuyên cụm gần như không có. 'full_section': "
+                         "cả section = 1 batch (chính xác tuyệt đối nhưng chậm hơn).")
     _p.add_argument('--ablation', choices=list(ABLATION_FLAGS), default='full')
     _p.add_argument('--patch-size', type=int, default=224)
     _p.add_argument('--num-workers', type=int, default=2)

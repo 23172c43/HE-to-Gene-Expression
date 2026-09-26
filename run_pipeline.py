@@ -189,9 +189,16 @@ _p.add_argument('--batch-sampler', choices=['random', 'spatial_cluster'], defaul
                      "thanh 1 cum khong gian lien ke (K-means) -- sua loi lech pha "
                      "train/test cua Spatial SGC, cung nguyen nhan da sua ben HEST, muc "
                      "do nhe hon vi section HER2ST it spot hon.")
+_p.add_argument('--test-batch-sampler', choices=['spatial_cluster', 'full_section'],
+                default='spatial_cluster',
+                help="Cách gom batch khi TEST/predict: 'spatial_cluster' (mặc định, "
+                     "nhanh + ít VRAM): mỗi batch = cụm không gian liền kề → gần bằng "
+                     "full_section. 'full_section': cả section = 1 batch (chính xác tuyệt "
+                     "đối nhưng chậm hơn — hành vi cũ).")
 _args = _p.parse_args()
 DATASET = _args.datasets
 BATCH_SAMPLER = _args.batch_sampler
+TEST_BATCH_SAMPLER = _args.test_batch_sampler
 SKIP_TRAIN = _args.skip_train
 ABLATION = _args.ablation
 # Map ablation name -> 3 co cua model
@@ -479,20 +486,20 @@ def run_fold(fold):
     for section, A_norm in test_dataset.A_norm_cache.items():
         best_model.set_graph(section, torch.from_numpy(A_norm).float())
 
-    # [SỬA lỗi #4 -- bản đầy đủ] test_loader phải đưa TOÀN BỘ spot của 1 section vào
-    # cùng 1 batch để Spatial SGC lấy đúng A_norm_full[local_indices][:, local_indices]
-    # với ĐẦY ĐỦ thông tin lân cận, đúng Eq.(9)-(12).
-    # Bản sửa trước (batch_size=1 -> BATCH_SIZE=32) đã hết cắt xén 1x1 nhưng VẪN cắt
-    # section 300-700 spot thành nhiều batch 32-spot liên tiếp theo index -> A_norm_batch
-    # chỉ là ma trận con 32x32, không phải toàn đồ thị section như bài báo mô tả.
-    # full_section=True bỏ giới hạn batch_size khi CẮT BATCH cho test (mỗi section = 1
-    # batch trọn vẹn); model.cnn_chunk (=BATCH_SIZE, không đổi) vẫn chunk CNN feature
-    # extractor thành các nhóm nhỏ bên trong forward() như thiết kế, chỉ khác là chunk
-    # giờ mới thực sự được kích hoạt (trước đây B<=32<=cnn_chunk nên vòng lặp chunk chỉ
-    # chạy đúng 1 lần, không có tác dụng gì).
-    # SectionBatchSampler với shuffle=False đảm bảo mỗi batch CHỈ chứa 1 section.
-    test_sampler = SectionBatchSampler(test_dataset, batch_size=BATCH_SIZE, shuffle=False,
-                                        full_section=True)
+    # [SỬA predict nhanh] Test thay vì full_section (cả section = 1 batch rất chậm/nặng
+    # với HEST/Visium vài nghìn spot) → dùng SpatialClusterBatchSampler: mỗi batch = 1
+    # cụm KHÔNG GIAN liền kề (K-means). Vì SGC chỉ nối k-NN gần, cạnh xuyên cụm gần như
+    # không có → kết quả gần bằng full_section nhưng nhanh + tốn ít VRAM hơn nhiều.
+    # Chọn test sampler theo --test-batch-sampler (xem help):
+    #  'spatial_cluster' (mặc định): mỗi batch = cụm không gian liền kề → nhanh, ít VRAM.
+    #  'full_section'     : cả section = 1 batch (chính xác tuyệt đối, chậm hơn).
+    # lighthggep_predict vẫn torch.cat các batch lại đúng thứ tự section (shuffle=False).
+    if TEST_BATCH_SAMPLER == 'spatial_cluster':
+        test_sampler = SpatialClusterBatchSampler(test_dataset, batch_size=BATCH_SIZE,
+                                                  shuffle=False)
+    else:
+        test_sampler = SectionBatchSampler(test_dataset, batch_size=BATCH_SIZE,
+                                           shuffle=False, full_section=True)
     test_loader = DataLoader(test_dataset, batch_sampler=test_sampler,
                              collate_fn=section_collate_fn, **eval_loader_options)
 
