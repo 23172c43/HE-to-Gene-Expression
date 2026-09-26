@@ -216,7 +216,7 @@ LEARNING_RATE = 1e-4
 K_NEIGHBORS = _args.k
 BATCH_SIZE = 32  # Light-HGGEP rat nhe nen co the tang batch size
 CNN_CHUNK = _args.cnn_chunk if _args.cnn_chunk is not None else BATCH_SIZE
-NUM_WORKERS = 2  # per DDP rank (4 loader workers total with 2 GPUs)
+NUM_WORKERS = 0  # per DDP rank (4 loader workers total with 2 GPUs)
 
 CKPT_DIR = "model_ckpts"
 os.makedirs(CKPT_DIR, exist_ok=True)
