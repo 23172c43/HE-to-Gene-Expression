@@ -203,7 +203,11 @@ def run_fold(fold, args, gene_list, cnn_chunk):
     rho, _ = get_Spearman(ap, ag, section_ids=section_ids)
     mse = get_MSE(ap, ag, section_ids=section_ids)
     mae = get_MAE(ap, ag, section_ids=section_ids)
-    morans = get_MoransI_all(ap, ag, top_k=50, section_ids=section_ids)
+    # --no-morans: bỏ Moran's I (chậm O(N²×top_k)) khi không cần, chỉ giữ 4 metric chính.
+    if args.no_morans:
+        morans = None
+    else:
+        morans = get_MoransI_all(ap, ag, top_k=50, section_ids=section_ids)
 
     n_spots = adata_pred.shape[0]
     total_params = sum(p.numel() for p in best_model.parameters())
@@ -219,8 +223,8 @@ def run_fold(fold, args, gene_list, cnn_chunk):
         'spearman': float(np.nanmean(rho)),
         'rmse': float(np.nanmean(np.sqrt(mse))),
         'mae': float(np.nanmean(mae)),
-        'morans_i_pred': float(np.nanmean(morans['pred'])),
-        'morans_i_gt': float(np.nanmean(morans['gt'])),
+        'morans_i_pred': (float(np.nanmean(morans['pred'])) if morans is not None else float('nan')),
+        'morans_i_gt': (float(np.nanmean(morans['gt'])) if morans is not None else float('nan')),
         'params': total_params,
         'inference_time_total_s': inference_time_total_s,
         'inference_time_per_spot_ms': 1000.0 * inference_time_total_s / max(n_spots, 1),
@@ -258,9 +262,12 @@ def main():
                          "nhanh + ít VRAM): mỗi batch = cụm không gian liền kề → gần bằng "
                          "full_section vì k-NN xuyên cụm gần như không có. 'full_section': "
                          "cả section = 1 batch (chính xác tuyệt đối nhưng chậm hơn).")
+    _p.add_argument('--no-morans', action='store_true',
+                    help="Bỏ tính Moran's I (chậm O(N²×top_k)). Chỉ giữ PCC/Spearman/RMSE/MAE "
+                         "→ chạy nhanh hơn. Cột morans_i_* trong CSV sẽ là NaN.")
     _p.add_argument('--ablation', choices=list(ABLATION_FLAGS), default='full')
     _p.add_argument('--patch-size', type=int, default=224)
-    _p.add_argument('--num-workers', type=int, default=2)
+    _p.add_argument('--num-workers', type=int, default=0)
     _p.add_argument('--batch-size', type=int, default=32)
     _p.add_argument('--cnn-chunk', type=int, default=None,
                     help="Số patch xử lý đồng thời qua CNN trong forward. "

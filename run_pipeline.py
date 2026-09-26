@@ -195,10 +195,14 @@ _p.add_argument('--test-batch-sampler', choices=['spatial_cluster', 'full_sectio
                      "nhanh + ít VRAM): mỗi batch = cụm không gian liền kề → gần bằng "
                      "full_section. 'full_section': cả section = 1 batch (chính xác tuyệt "
                      "đối nhưng chậm hơn — hành vi cũ).")
+_p.add_argument('--fast-eval', action='store_true',
+                help="Chỉ tính PCC/Spearman/RMSE/MAE (bỏ Moran's I và t-SNE/PCA — 2 bước "
+                     "O(N²) rất chậm). Nhanh hơn nhiều; ARI/NMI và morans_i_* = NaN.")
 _args = _p.parse_args()
 DATASET = _args.datasets
 BATCH_SAMPLER = _args.batch_sampler
 TEST_BATCH_SAMPLER = _args.test_batch_sampler
+FAST_EVAL = _args.fast_eval
 SKIP_TRAIN = _args.skip_train
 ABLATION = _args.ablation
 # Map ablation name -> 3 co cua model
@@ -216,7 +220,7 @@ LEARNING_RATE = 1e-4
 K_NEIGHBORS = _args.k
 BATCH_SIZE = 32  # Light-HGGEP rat nhe nen co the tang batch size
 CNN_CHUNK = _args.cnn_chunk if _args.cnn_chunk is not None else BATCH_SIZE
-NUM_WORKERS = 0  # per DDP rank (4 loader workers total with 2 GPUs)
+NUM_WORKERS = 0  # 0: dùng _SingleProcessDataLoaderIter tránh treo fork on Kaggle/Colab
 
 CKPT_DIR = "model_ckpts"
 os.makedirs(CKPT_DIR, exist_ok=True)
@@ -524,14 +528,29 @@ def run_fold(fold):
     # [SỬA - lỗi Moran's I đa lát cắt] test_dataset (LOPO) co the gom nhieu lat cat cua
     # 1 benh nhan -> phai bao section_ids de get_MoransI khong noi lang gieng xuyen lat
     # cat (xem predict.get_section_ids / predict.get_MoransI).
-    from predict import get_section_ids
+    from predict import get_section_ids, get_R, get_MSE, get_MAE, get_Spearman
     section_ids = get_section_ids(test_dataset)
-    adata_pred, metrics = evaluate_her2st_predictions(
-        adata_pred, adata_gt, g, label=label, n_clusters=4, section_ids=section_ids)
-    R, p_values = metrics['R'], metrics['p_values']
-    Spearman, spearman_pvalues = metrics['Spearman'], metrics['spearman_pvalues']
-    MSE, MAE, RMSE, morans = metrics['MSE'], metrics['MAE'], metrics['RMSE'], metrics['morans']
-    ARI, NMI = metrics['ARI'], metrics['NMI']
+    # --fast-eval: bỏ Moran's I (O(N²×top_k)) + t-SNE/PCA (O(N²×iter)) — chỉ giữ 4 metric
+    # chính (nhanh, đủ cho so sánh cơ bản). Ngược lại dùng evaluate_her2st_predictions đầy đủ.
+    if FAST_EVAL:
+        mask_genes = np.array((np.abs(adata_gt.X).max(axis=0) > 0)).flatten()
+        n_genes_eval = int(mask_genes.sum())
+        ap = adata_pred[:, mask_genes].copy()
+        ag = adata_gt[:, mask_genes].copy()
+        R, p_values = get_R(ap, ag, section_ids=section_ids)
+        Spearman, spearman_pvalues = get_Spearman(ap, ag, section_ids=section_ids)
+        MSE = get_MSE(ap, ag, section_ids=section_ids)
+        MAE = get_MAE(ap, ag, section_ids=section_ids)
+        RMSE = np.sqrt(MSE)
+        morans = None          # không tính
+        ARI = NMI = float('nan')
+    else:
+        adata_pred, metrics = evaluate_her2st_predictions(
+            adata_pred, adata_gt, g, label=label, n_clusters=4, section_ids=section_ids)
+        R, p_values = metrics['R'], metrics['p_values']
+        Spearman, spearman_pvalues = metrics['Spearman'], metrics['spearman_pvalues']
+        MSE, MAE, RMSE, morans = metrics['MSE'], metrics['MAE'], metrics['RMSE'], metrics['morans']
+        ARI, NMI = metrics['ARI'], metrics['NMI']
 
     # ==================== IN KẾT QUẢ CHI TIẾT ====================
 
@@ -545,14 +564,16 @@ def run_fold(fold):
     print(f"  [INFER TIME] total={inference_time_total_s:.3f}s "
           f"({n_spots} spot) -> {inference_time_per_spot_ms:.3f} ms/spot")
     print(f"  [PEAK MEM]   {peak_inference_memory_mb:.1f} MB")
-    mean_pcc      = metrics['pearson']
-    median_pcc    = metrics['median_pearson']
-    std_pcc       = np.nanstd(R)
-    mean_spearman = metrics['spearman']
-    mean_rmse     = metrics['rmse']
-    mean_mae      = metrics['mae']
-    mean_mi_pred  = metrics['morans_i_pred']
-    mean_mi_gt    = metrics['morans_i_gt']
+    # FAST_EVAL: metrics dict ko tồn tại → tính trực tiếp từ R/Spearman/RMSE/MAE.
+    # morans có thể là None (--fast-eval) → guard NaN.
+    mean_pcc      = float(np.nanmean(R))
+    median_pcc    = float(np.nanmedian(R))
+    std_pcc       = float(np.nanstd(R))
+    mean_spearman = float(np.nanmean(Spearman))
+    mean_rmse     = float(np.nanmean(RMSE))
+    mean_mae      = float(np.nanmean(MAE))
+    mean_mi_pred  = float(np.nanmean(morans['pred'])) if morans is not None else float('nan')
+    mean_mi_gt    = float(np.nanmean(morans['gt']))   if morans is not None else float('nan')
 
     print(f"  Số spot test đã đánh giá  : {n_spots}")
     print(f"  Số gene đánh giá          : {len(R)}")
@@ -668,8 +689,8 @@ def run_fold(fold):
         'nmi':            NMI,
         'rmse':           np.nanmean(RMSE),
         'mae':            np.nanmean(MAE),
-        'morans_i_pred':  np.nanmean(morans['pred']),
-        'morans_i_gt':    np.nanmean(morans['gt']),
+        'morans_i_pred':  (np.nanmean(morans['pred']) if morans is not None else float('nan')),
+        'morans_i_gt':    (np.nanmean(morans['gt'])   if morans is not None else float('nan')),
         'params':         total_params,
         'inference_time_total_s':     inference_time_total_s,
         'inference_time_per_spot_ms': inference_time_per_spot_ms,
